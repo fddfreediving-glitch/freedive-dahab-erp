@@ -1,0 +1,4843 @@
+import { Router, Request, Response } from 'express';
+import crypto from 'crypto';
+import { db, type BookingSafetyRules } from './db.js';
+import type { PosCatalogItem, PosCatalogItemInput } from '../src/types.js';
+import {
+  hashPassword,
+  verifyPassword,
+  generateSessionToken,
+  requireAuth,
+  requireRole,
+  logAudit,
+  maskStudentData,
+} from './auth.js';
+
+export const apiRouter = Router();
+
+// Passwordless role switching exists for local training only. It must be
+// explicitly enabled and must never be reachable on a deployed system.
+// Read lazily: this module is imported before dotenv loads .env.
+const demoLoginEnabled = () => process.env.ALLOW_DEMO_LOGIN === 'true';
+
+const posCatalogColumns = `
+  id, group_name AS "group", name, category, price, price_currency, unit, description,
+  tier_minimum_quantity, tier_unit_price, stay_discount, is_active, created_at, updated_at
+`;
+const posCatalogGroups = ['Courses', 'Packages', 'Training', 'Activities', 'Accommodation', 'Shop'];
+const posCatalogCategories = [
+  'course', 'package', 'accommodation', 'activity', 'workshop', 'training', 'gear_rental', 'shop', 'other',
+];
+const posCatalogCurrencies = ['EUR', 'EGP', 'USD', 'GBP'];
+
+function parsePosCatalogItem(value: unknown): { item?: PosCatalogItemInput; error?: string } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { error: 'A catalogue item is required' };
+  }
+  const body = value as Record<string, unknown>;
+  if (typeof body.group !== 'string' || !posCatalogGroups.includes(body.group)) {
+    return { error: 'Choose a supported product or service group' };
+  }
+  if (typeof body.name !== 'string' || !body.name.trim() || body.name.trim().length > 120) {
+    return { error: 'Name is required and must be 120 characters or fewer' };
+  }
+  if (typeof body.category !== 'string' || !posCatalogCategories.includes(body.category)) {
+    return { error: 'Choose a supported item category' };
+  }
+  const price = body.price === null ? null : Number(body.price);
+  if (price !== null && (!Number.isFinite(price) || price <= 0)) {
+    return { error: 'Price must be positive or left blank for a staff-confirmed price' };
+  }
+  const priceCurrency = body.price_currency === null ? null : body.price_currency;
+  if (priceCurrency !== null && (typeof priceCurrency !== 'string' || !posCatalogCurrencies.includes(priceCurrency))) {
+    return { error: 'Choose a supported catalogue currency' };
+  }
+  if (price !== null && priceCurrency === null) {
+    return { error: 'A currency is required when a catalogue price is set' };
+  }
+  const minimumQuantity = body.tier_minimum_quantity === null ? null : Number(body.tier_minimum_quantity);
+  const tierUnitPrice = body.tier_unit_price === null ? null : Number(body.tier_unit_price);
+  if ((minimumQuantity === null) !== (tierUnitPrice === null) ||
+      (minimumQuantity !== null && (!Number.isInteger(minimumQuantity) || minimumQuantity < 2)) ||
+      (tierUnitPrice !== null && (!Number.isFinite(tierUnitPrice) || tierUnitPrice <= 0))) {
+    return { error: 'A group rate needs a minimum quantity of at least two and a positive unit price' };
+  }
+  if (typeof body.stay_discount !== 'boolean') {
+    return { error: 'Stay discount must be enabled or disabled' };
+  }
+  if (body.stay_discount && body.group !== 'Accommodation') {
+    return { error: 'Long-stay discounts are only available for accommodation items' };
+  }
+  if (body.unit !== null && (typeof body.unit !== 'string' || body.unit.length > 40)) {
+    return { error: 'Unit must be 40 characters or fewer' };
+  }
+  if (body.description !== null && (typeof body.description !== 'string' || body.description.length > 2000)) {
+    return { error: 'Description must be 2,000 characters or fewer' };
+  }
+
+  return {
+    item: {
+      group: body.group as PosCatalogItemInput['group'],
+      name: body.name.trim(),
+      category: body.category as PosCatalogItemInput['category'],
+      price,
+      price_currency: priceCurrency as PosCatalogItemInput['price_currency'],
+      unit: typeof body.unit === 'string' ? body.unit.trim() || null : null,
+      description: typeof body.description === 'string' ? body.description.trim() || null : null,
+      tier_minimum_quantity: minimumQuantity,
+      tier_unit_price: tierUnitPrice,
+      stay_discount: body.stay_discount,
+    },
+  };
+}
+
+// ==========================================
+// 1. AUTHENTICATION & SESSION MANAGEMENT
+// ==========================================
+
+apiRouter.post('/auth/login', (req: Request, res: Response): void => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    res.status(400).json({ error: 'Email and password are required' });
+    return;
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase().trim()) as any;
+  if (!user) {
+    logAudit({
+      userEmail: email,
+      action: 'LOGIN_FAILED',
+      entityType: 'AUTH',
+      details: { reason: 'User not found' },
+      ip: req.ip,
+    });
+    res.status(401).json({ error: 'Invalid email or password' });
+    return;
+  }
+
+  if (!user.is_active) {
+    res.status(403).json({ error: 'This account has been disabled. Please contact the Dahab center owner.' });
+    return;
+  }
+
+  const isValid = verifyPassword(password, user.password_hash, user.salt);
+  if (!isValid) {
+    logAudit({
+      userId: user.id,
+      userEmail: user.email,
+      userRole: user.role,
+      action: 'LOGIN_FAILED',
+      entityType: 'AUTH',
+      details: { reason: 'Incorrect password' },
+      ip: req.ip,
+    });
+    res.status(401).json({ error: 'Invalid email or password' });
+    return;
+  }
+
+  // Create session (valid for 7 days)
+  const token = generateSessionToken();
+  const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO sessions (token, user_id, expires_at, created_at)
+    VALUES (?, ?, ?, ?)
+  `).run(token, user.id, expiresAt, now);
+
+  // Set HTTP-only cookie
+  res.cookie('freedive_session', token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+
+  logAudit({
+    userId: user.id,
+    userEmail: user.email,
+    userRole: user.role,
+    action: 'LOGIN_SUCCESS',
+    entityType: 'AUTH',
+    details: { loginMethod: 'credentials' },
+    ip: req.ip,
+  });
+
+  res.json({
+    token,
+    user: {
+      id: user.id,
+      email: user.email,
+      full_name: user.full_name,
+      role: user.role,
+      phone: user.phone,
+      languages: JSON.parse(user.languages || '[]'),
+      certifications: JSON.parse(user.certifications || '[]'),
+    },
+  });
+});
+
+apiRouter.post('/auth/logout', requireAuth, (req: Request, res: Response): void => {
+  if (req.sessionToken) {
+    db.prepare('DELETE FROM sessions WHERE token = ?').run(req.sessionToken);
+  }
+  res.clearCookie('freedive_session');
+  logAudit({
+    userId: req.user?.id,
+    userEmail: req.user?.email,
+    userRole: req.user?.role,
+    action: 'LOGOUT',
+    entityType: 'AUTH',
+    ip: req.ip,
+  });
+  res.json({ success: true, message: 'Logged out successfully' });
+});
+
+apiRouter.get('/auth/me', requireAuth, (req: Request, res: Response): void => {
+  res.json({
+    user: {
+      ...req.user,
+      languages: typeof req.user?.languages === 'string' ? JSON.parse(req.user.languages) : req.user?.languages,
+      certifications: typeof req.user?.certifications === 'string' ? JSON.parse(req.user.certifications) : req.user?.certifications,
+    },
+  });
+});
+
+// Role switcher helper for demonstration & evaluation of permissions
+apiRouter.post('/auth/switch-demo', (req: Request, res: Response): void => {
+  if (!demoLoginEnabled()) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+
+  const { role, email } = req.body;
+  let targetUser: any;
+
+  if (email) {
+    targetUser = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  } else if (role) {
+    targetUser = db.prepare('SELECT * FROM users WHERE role = ? AND is_active = 1 LIMIT 1').get(role);
+  }
+
+  if (!targetUser) {
+    res.status(404).json({ error: 'Target user role not found' });
+    return;
+  }
+
+  const token = generateSessionToken();
+  const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+  db.prepare(`
+    INSERT INTO sessions (token, user_id, expires_at, created_at)
+    VALUES (?, ?, ?, ?)
+  `).run(token, targetUser.id, expiresAt, new Date().toISOString());
+
+  res.cookie('freedive_session', token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+
+  logAudit({
+    userId: targetUser.id,
+    userEmail: targetUser.email,
+    userRole: targetUser.role,
+    action: 'ROLE_SWITCHED_DEMO',
+    entityType: 'AUTH',
+    details: { switchedTo: targetUser.role },
+    ip: req.ip,
+  });
+
+  res.json({
+    token,
+    user: {
+      id: targetUser.id,
+      email: targetUser.email,
+      full_name: targetUser.full_name,
+      role: targetUser.role,
+      phone: targetUser.phone,
+      languages: JSON.parse(targetUser.languages || '[]'),
+      certifications: JSON.parse(targetUser.certifications || '[]'),
+    },
+  });
+});
+
+// ==========================================
+// 2. STAFF & EMPLOYEE MANAGEMENT
+// ==========================================
+
+apiRouter.get('/users', requireAuth, (req: Request, res: Response): void => {
+  // If instructor or front desk, only return public staff directory (name, email, role, certs, phone)
+  const isPrivileged = ['owner', 'operations_manager', 'hr', 'finance'].includes(req.user!.role);
+  
+  if (isPrivileged) {
+    const users = db.prepare(`
+      SELECT id, email, full_name, role, is_active, phone, emergency_contact, languages, certifications,
+             hourly_rate, session_commission, monthly_salary, created_at
+      FROM users ORDER BY full_name ASC
+    `).all();
+    res.json(users.map((u: any) => ({
+      ...u,
+      languages: JSON.parse(u.languages || '[]'),
+      certifications: JSON.parse(u.certifications || '[]'),
+    })));
+  } else {
+    // Limited directory for instructors / gear team
+    const users = db.prepare(`
+      SELECT id, email, full_name, role, phone, languages, certifications
+      FROM users WHERE is_active = 1 ORDER BY full_name ASC
+    `).all();
+    res.json(users.map((u: any) => ({
+      ...u,
+      languages: JSON.parse(u.languages || '[]'),
+      certifications: JSON.parse(u.certifications || '[]'),
+    })));
+  }
+});
+
+apiRouter.post('/users', requireAuth, requireRole(['owner', 'hr']), (req: Request, res: Response): void => {
+  const {
+    email,
+    password,
+    full_name,
+    role,
+    phone,
+    emergency_contact,
+    languages,
+    certifications,
+    monthly_salary,
+    hourly_rate,
+    session_commission,
+  } = req.body;
+
+  if (!email || !password || !full_name || !role) {
+    res.status(400).json({ error: 'Email, password, full name, and role are required' });
+    return;
+  }
+
+  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase().trim());
+  if (existing) {
+    res.status(400).json({ error: 'A staff user with this email already exists' });
+    return;
+  }
+
+  const { hash, salt } = hashPassword(password);
+  const id = 'usr_' + crypto.randomUUID().slice(0, 10);
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO users (id, email, password_hash, salt, full_name, role, is_active, phone, emergency_contact, languages, certifications, monthly_salary, hourly_rate, session_commission, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    email.toLowerCase().trim(),
+    hash,
+    salt,
+    full_name,
+    role,
+    phone || null,
+    emergency_contact || null,
+    JSON.stringify(languages || ['English']),
+    JSON.stringify(certifications || []),
+    monthly_salary || 0,
+    hourly_rate || 0,
+    session_commission || 0,
+    now,
+    now
+  );
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'CREATE_USER',
+    entityType: 'USER',
+    entityId: id,
+    details: { email, role, full_name },
+    ip: req.ip,
+  });
+
+  res.status(201).json({ id, message: 'Staff member account created successfully' });
+});
+
+apiRouter.patch('/users/:id', requireAuth, requireRole(['owner', 'hr']), (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const {
+    full_name,
+    role,
+    is_active,
+    phone,
+    emergency_contact,
+    languages,
+    certifications,
+    monthly_salary,
+    hourly_rate,
+    session_commission,
+    password,
+  } = req.body;
+
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(id) as any;
+  if (!user) {
+    res.status(404).json({ error: 'User not found' });
+    return;
+  }
+
+  // Prevent disabling the last owner
+  if (user.role === 'owner' && is_active === 0) {
+    const ownerCount = (db.prepare('SELECT COUNT(*) as count FROM users WHERE role = "owner" AND is_active = 1').get() as any).count;
+    if (ownerCount <= 1) {
+      res.status(400).json({ error: 'Cannot deactivate the sole system owner account.' });
+      return;
+    }
+  }
+
+  const updates: string[] = ['updated_at = ?'];
+  const values: any[] = [new Date().toISOString()];
+
+  if (full_name !== undefined) { updates.push('full_name = ?'); values.push(full_name); }
+  if (role !== undefined) { updates.push('role = ?'); values.push(role); }
+  if (is_active !== undefined) { updates.push('is_active = ?'); values.push(is_active ? 1 : 0); }
+  if (phone !== undefined) { updates.push('phone = ?'); values.push(phone); }
+  if (emergency_contact !== undefined) { updates.push('emergency_contact = ?'); values.push(emergency_contact); }
+  if (languages !== undefined) { updates.push('languages = ?'); values.push(JSON.stringify(languages)); }
+  if (certifications !== undefined) { updates.push('certifications = ?'); values.push(JSON.stringify(certifications)); }
+  if (monthly_salary !== undefined) { updates.push('monthly_salary = ?'); values.push(Number(monthly_salary)); }
+  if (hourly_rate !== undefined) { updates.push('hourly_rate = ?'); values.push(Number(hourly_rate)); }
+  if (session_commission !== undefined) { updates.push('session_commission = ?'); values.push(Number(session_commission)); }
+  if (password) {
+    const { hash, salt } = hashPassword(password);
+    updates.push('password_hash = ?', 'salt = ?');
+    values.push(hash, salt);
+  }
+
+  values.push(id);
+  db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+
+  // If user was deactivated, terminate all their active sessions immediately
+  if (is_active === 0) {
+    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+  }
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'UPDATE_USER',
+    entityType: 'USER',
+    entityId: id,
+    details: { updatedFields: Object.keys(req.body) },
+    ip: req.ip,
+  });
+
+  res.json({ message: 'User updated successfully' });
+});
+
+// ==========================================
+// 3. STUDENTS & CRM MODULE
+// ==========================================
+
+apiRouter.get('/students', requireAuth, (req: Request, res: Response): void => {
+  const { search, agency, status } = req.query;
+  let query = 'SELECT * FROM students WHERE 1=1';
+  const params: any[] = [];
+
+  if (search) {
+    query += ' AND (first_name LIKE ? OR last_name LIKE ? OR email LIKE ? OR phone LIKE ?)';
+    const term = `%${search}%`;
+    params.push(term, term, term, term);
+  }
+
+  if (agency) {
+    query += ' AND certification_agency = ?';
+    params.push(agency);
+  }
+
+  if (status) {
+    query += ' AND status = ?';
+    params.push(status);
+  }
+
+  query += ' ORDER BY created_at DESC';
+
+  const rows = db.prepare(query).all(...params) as any[];
+
+  const activitiesByStudent = new Map<string, Array<Record<string, unknown>>>();
+  const activityRows = db.prepare(`
+    SELECT b.student_id, c.title, b.status, s.start_date, s.end_date
+    FROM bookings b
+    JOIN courses c ON c.id = b.course_id
+    LEFT JOIN course_sessions s ON s.id = b.session_id
+    WHERE b.status != 'cancelled'
+    ORDER BY COALESCE(s.start_date, b.booking_date) DESC
+  `).all() as Array<any>;
+  for (const activity of activityRows) {
+    const list = activitiesByStudent.get(activity.student_id) ?? [];
+    list.push({
+      title: activity.title,
+      status: activity.status,
+      start_date: activity.start_date ?? null,
+      end_date: activity.end_date ?? null,
+    });
+    activitiesByStudent.set(activity.student_id, list);
+  }
+
+  const paidByStudent = new Map<string, number>();
+  const paidRows = db.prepare(`
+    SELECT i.student_id,
+           COALESCE(SUM(p.eur_amount_cents), 0) AS eur_cents,
+           COALESCE(SUM(CASE WHEN p.eur_amount_cents IS NULL AND p.currency = 'EUR'
+                             THEN ROUND(p.amount * 100) ELSE 0 END), 0) AS legacy_eur_cents
+    FROM payments p
+    JOIN invoices i ON i.id = p.invoice_id
+    WHERE i.status != 'cancelled'
+    GROUP BY i.student_id
+  `).all() as Array<{ student_id: string; eur_cents: number; legacy_eur_cents: number }>;
+  for (const row of paidRows) {
+    paidByStudent.set(row.student_id, Math.round(row.eur_cents + row.legacy_eur_cents) / 100);
+  }
+
+  // The deposit is the first payment recorded on each bill.
+  const depositByStudent = new Map<string, number>();
+  const depositRows = db.prepare(`
+    SELECT i.student_id,
+           COALESCE(SUM(COALESCE(firsts.eur_amount_cents,
+             CASE WHEN firsts.currency = 'EUR' THEN ROUND(firsts.amount * 100) ELSE 0 END)), 0) AS eur_cents
+    FROM (
+      SELECT p.invoice_id, p.currency, p.amount, p.eur_amount_cents,
+             ROW_NUMBER() OVER (PARTITION BY p.invoice_id ORDER BY p.payment_date ASC, p.created_at ASC) AS rn
+      FROM payments p
+    ) firsts
+    JOIN invoices i ON i.id = firsts.invoice_id
+    WHERE firsts.rn = 1 AND i.status != 'cancelled'
+    GROUP BY i.student_id
+  `).all() as Array<{ student_id: string; eur_cents: number }>;
+  for (const row of depositRows) {
+    depositByStudent.set(row.student_id, Math.round(row.eur_cents) / 100);
+  }
+
+  // Apply server-side medical data restriction for non-authorized roles
+  const masked = rows.map((student) => maskStudentData({
+    ...student,
+    activities: activitiesByStudent.get(student.id) ?? [],
+    paid_total_eur: paidByStudent.get(student.id) ?? 0,
+    deposit_paid_eur: depositByStudent.get(student.id) ?? 0,
+  }, req.user!.role));
+  res.json(masked);
+});
+
+apiRouter.get('/students/:id', requireAuth, (req: Request, res: Response): void => {
+  const student = db.prepare('SELECT * FROM students WHERE id = ?').get(req.params.id) as any;
+  if (!student) {
+    res.status(404).json({ error: 'Student not found' });
+    return;
+  }
+
+  // Get student's bookings
+  const bookings = db.prepare(`
+    SELECT b.*, c.title as course_title, c.code as course_code
+    FROM bookings b
+    JOIN courses c ON b.course_id = c.id
+    WHERE b.student_id = ?
+    ORDER BY b.booking_date DESC
+  `).all(student.id);
+
+  // Get student's inquiries
+  const inquiries = db.prepare(`
+    SELECT * FROM inquiries WHERE student_id = ? ORDER BY created_at DESC
+  `).all(student.id);
+
+  // Invoices (only for owner & finance)
+  let invoices: any[] = [];
+  if (['owner', 'finance'].includes(req.user!.role)) {
+    invoices = db.prepare(`
+      SELECT * FROM invoices WHERE student_id = ? ORDER BY issue_date DESC
+    `).all(student.id);
+  }
+
+  const masked = maskStudentData(student, req.user!.role);
+  res.json({
+    student: masked,
+    bookings,
+    inquiries,
+    invoices,
+  });
+});
+
+apiRouter.post('/students', requireAuth, (req: Request, res: Response): void => {
+  const {
+    first_name,
+    last_name,
+    email,
+    phone,
+    whatsapp,
+    arrival_date,
+    departure_date,
+    needs_accommodation,
+    needs_airport_transfer,
+    flight_number,
+    airline_name,
+    flight_arrival_at,
+    transportation_requirements,
+    hotel_name,
+    assigned_driver,
+    nationality,
+    age,
+    date_of_birth,
+    certification_agency,
+    certification_level,
+    total_depth_pb,
+    static_apnea_pb,
+    medical_waiver_signed,
+    medical_waiver_date,
+    medical_clearance_status,
+    medical_notes,
+    emergency_contact_name,
+    emergency_contact_phone,
+    insurance_details,
+    source_channel,
+    status,
+    notes,
+  } = req.body;
+
+  if (!first_name || !last_name || !email) {
+    res.status(400).json({ error: 'First name, last name, and email are required' });
+    return;
+  }
+  if (medical_waiver_signed !== undefined &&
+      typeof medical_waiver_signed !== 'boolean' &&
+      medical_waiver_signed !== 0 &&
+      medical_waiver_signed !== 1) {
+    res.status(400).json({ error: 'Waiver signed status must be true or false' });
+    return;
+  }
+  const waiverIsSigned = medical_waiver_signed === true || medical_waiver_signed === 1;
+  if (medical_notes && !['owner', 'operations_manager', 'hr'].includes(req.user!.role)) {
+    res.status(403).json({ error: 'Only authorized health roles may record medical notes' });
+    return;
+  }
+  if (waiverIsSigned && !['owner', 'operations_manager', 'front_desk_crm', 'hr'].includes(req.user!.role)) {
+    res.status(403).json({ error: 'Only authorized operations roles may record a signed waiver' });
+    return;
+  }
+  if (waiverIsSigned && (!isValidDate(medical_waiver_date) || medical_waiver_date > new Date().toISOString().slice(0, 10))) {
+    res.status(400).json({ error: 'A valid, non-future waiver date is required when the waiver is signed' });
+    return;
+  }
+  if (status !== undefined && !['lead', 'inquiry', 'active', 'certified', 'inactive'].includes(status)) {
+    res.status(400).json({ error: 'Student status is not supported' });
+    return;
+  }
+  if (date_of_birth && (!isValidDate(date_of_birth) || date_of_birth > new Date().toISOString().slice(0, 10))) {
+    res.status(400).json({ error: 'Date of birth must be a valid date that is not in the future' });
+    return;
+  }
+  if (age !== undefined && age !== null && age !== '' && (!Number.isInteger(Number(age)) || Number(age) < 1 || Number(age) > 120)) {
+    res.status(400).json({ error: 'Age must be a whole number between 1 and 120' });
+    return;
+  }
+  const stayError = validateStayDetails({
+    whatsapp,
+    arrival_date,
+    departure_date,
+    needs_accommodation,
+    needs_airport_transfer,
+    flight_number,
+    airline_name,
+    flight_arrival_at,
+    transportation_requirements,
+    hotel_name,
+    assigned_driver,
+    notes,
+  });
+  if (stayError) {
+    res.status(400).json({ error: stayError });
+    return;
+  }
+  if (medical_clearance_status !== undefined && !['owner', 'operations_manager', 'hr'].includes(req.user!.role)) {
+    res.status(403).json({ error: 'Only authorized health roles may record medical clearance' });
+    return;
+  }
+  if (medical_clearance_status !== undefined &&
+      !['unknown', 'cleared', 'physician_approved'].includes(medical_clearance_status)) {
+    res.status(400).json({ error: 'Medical clearance status is not supported' });
+    return;
+  }
+
+  const existing = db.prepare('SELECT id FROM students WHERE email = ?').get(email.toLowerCase().trim());
+  if (existing) {
+    res.status(400).json({ error: 'A student with this email already exists' });
+    return;
+  }
+
+  const id = 'std_' + crypto.randomUUID().slice(0, 10);
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO students (
+      id, first_name, last_name, email, phone, whatsapp, arrival_date, departure_date,
+      needs_accommodation, needs_airport_transfer, flight_number, airline_name,
+      flight_arrival_at, transportation_requirements, hotel_name, assigned_driver,
+      nationality, age, date_of_birth, certification_agency, certification_level,
+      total_depth_pb, static_apnea_pb, medical_waiver_signed, medical_waiver_date,
+      medical_clearance_status, medical_notes, emergency_contact_name,
+      emergency_contact_phone, insurance_details, source_channel, status, notes,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    first_name.trim(),
+    last_name.trim(),
+    email.toLowerCase().trim(),
+    phone || null,
+    optionalText(whatsapp),
+    arrival_date || null,
+    departure_date || null,
+    stayFlag(needs_accommodation) ?? 0,
+    stayFlag(needs_airport_transfer) ?? 0,
+    optionalText(flight_number),
+    optionalText(airline_name),
+    flight_arrival_at || null,
+    optionalText(transportation_requirements),
+    optionalText(hotel_name),
+    optionalText(assigned_driver),
+    nationality || null,
+    age === undefined || age === null || age === '' ? null : Number(age),
+    date_of_birth || null,
+    certification_agency || 'None',
+    certification_level || 'Beginner',
+    Number(total_depth_pb) || 0,
+    static_apnea_pb || '00:00',
+    medical_waiver_signed ? 1 : 0,
+    medical_waiver_date || null,
+    medical_clearance_status || 'unknown',
+    medical_notes || null,
+    emergency_contact_name || null,
+    emergency_contact_phone || null,
+    insurance_details || null,
+    source_channel || 'Walk-in',
+    status || 'active',
+    notes || null,
+    now,
+    now
+  );
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'CREATE_STUDENT',
+    entityType: 'STUDENT',
+    entityId: id,
+    details: { name: `${first_name} ${last_name}`, email },
+    ip: req.ip,
+  });
+
+  res.status(201).json({ id, message: 'Student registered successfully' });
+});
+
+apiRouter.patch('/students/:id', requireAuth, (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const existing = db.prepare('SELECT * FROM students WHERE id = ?').get(id) as any;
+  if (!existing) {
+    res.status(404).json({ error: 'Student not found' });
+    return;
+  }
+  const waiverFieldsChanged =
+    req.body.medical_waiver_signed !== undefined ||
+    req.body.medical_waiver_date !== undefined;
+  if (waiverFieldsChanged && !['owner', 'operations_manager', 'front_desk_crm', 'hr'].includes(req.user!.role)) {
+    res.status(403).json({ error: 'Only authorized operations roles may update waiver records' });
+    return;
+  }
+  if (req.body.medical_waiver_signed !== undefined &&
+      typeof req.body.medical_waiver_signed !== 'boolean' &&
+      req.body.medical_waiver_signed !== 0 &&
+      req.body.medical_waiver_signed !== 1) {
+    res.status(400).json({ error: 'Waiver signed status must be true or false' });
+    return;
+  }
+  if (waiverFieldsChanged) {
+    const waiverIsSigned = req.body.medical_waiver_signed === undefined
+      ? existing.medical_waiver_signed === 1
+      : req.body.medical_waiver_signed === true || req.body.medical_waiver_signed === 1;
+    const waiverDate = req.body.medical_waiver_date === undefined
+      ? existing.medical_waiver_date
+      : req.body.medical_waiver_date;
+    if (waiverIsSigned && (!isValidDate(waiverDate) || waiverDate > new Date().toISOString().slice(0, 10))) {
+      res.status(400).json({ error: 'A valid, non-future waiver date is required when the waiver is signed' });
+      return;
+    }
+    if (waiverDate !== null && waiverDate !== undefined && !isValidDate(waiverDate)) {
+      res.status(400).json({ error: 'Waiver date must be a valid calendar date' });
+      return;
+    }
+  }
+
+  const nextArrival = req.body.arrival_date !== undefined ? req.body.arrival_date : existing.arrival_date;
+  const nextDeparture = req.body.departure_date !== undefined ? req.body.departure_date : existing.departure_date;
+  const stayError = validateStayDetails({
+    whatsapp: req.body.whatsapp,
+    arrival_date: nextArrival,
+    departure_date: nextDeparture,
+    needs_accommodation: req.body.needs_accommodation,
+    needs_airport_transfer: req.body.needs_airport_transfer,
+    flight_number: req.body.flight_number,
+    airline_name: req.body.airline_name,
+    flight_arrival_at: req.body.flight_arrival_at,
+    transportation_requirements: req.body.transportation_requirements,
+    hotel_name: req.body.hotel_name,
+    assigned_driver: req.body.assigned_driver,
+    notes: req.body.notes,
+  });
+  if (stayError) {
+    res.status(400).json({ error: stayError });
+    return;
+  }
+
+  const allowedFields = [
+    'first_name', 'last_name', 'email', 'phone', 'whatsapp', 'whatsapp_status', 'transfer_status', 'arrival_date', 'departure_date',
+    'needs_accommodation', 'needs_airport_transfer', 'flight_number', 'airline_name',
+    'flight_arrival_at', 'transportation_requirements', 'hotel_name', 'assigned_driver',
+    'nationality', 'age', 'date_of_birth', 'certification_agency', 'certification_level',
+    'total_depth_pb', 'static_apnea_pb', 'medical_waiver_signed', 'medical_waiver_date',
+    'medical_clearance_status', 'medical_notes', 'emergency_contact_name',
+    'emergency_contact_phone', 'insurance_details', 'source_channel', 'status', 'notes'
+  ];
+
+  const customerRecordFields = [
+    'first_name', 'last_name', 'email', 'phone', 'whatsapp', 'whatsapp_status', 'transfer_status',
+    'arrival_date', 'departure_date', 'needs_accommodation', 'needs_airport_transfer',
+    'flight_number', 'airline_name', 'flight_arrival_at', 'transportation_requirements',
+    'hotel_name', 'assigned_driver', 'source_channel', 'status', 'notes',
+  ];
+  const diverProfileFields = [
+    'nationality', 'age', 'date_of_birth', 'certification_agency', 'certification_level',
+    'total_depth_pb', 'static_apnea_pb',
+  ];
+  const customerRecordChanged = customerRecordFields.some((field) => req.body[field] !== undefined);
+  const diverProfileChanged = diverProfileFields.some((field) => req.body[field] !== undefined);
+  if (customerRecordChanged && !['owner', 'finance', 'operations_manager', 'front_desk_crm'].includes(req.user!.role)) {
+    res.status(403).json({ error: 'Only authorized customer operations roles may update customer contact and trip details' });
+    return;
+  }
+  if (diverProfileChanged && !['owner', 'operations_manager', 'front_desk_crm', 'instructor'].includes(req.user!.role)) {
+    res.status(403).json({ error: 'Only authorized operations and instructor roles may update diver profile details' });
+    return;
+  }
+
+  const updates: string[] = ['updated_at = ?'];
+  const values: any[] = [new Date().toISOString()];
+
+  // If role is instructor or front desk, restrict updating medical_notes
+  const isHealthAuthorized = ['owner', 'operations_manager', 'hr'].includes(req.user!.role);
+
+  for (const field of allowedFields) {
+    if (req.body[field] !== undefined) {
+      if (field === 'medical_notes' && !isHealthAuthorized) {
+        continue;
+      }
+      if (field === 'medical_clearance_status') {
+        if (!isHealthAuthorized) {
+          res.status(403).json({ error: 'Only authorized health roles may update medical clearance' });
+          return;
+        }
+        if (!['unknown', 'cleared', 'physician_approved'].includes(req.body[field])) {
+          res.status(400).json({ error: 'Medical clearance status must be unknown, cleared, or physician_approved' });
+          return;
+        }
+      }
+      if (field === 'age' && req.body.age !== null && req.body.age !== '' && (!Number.isInteger(Number(req.body.age)) || Number(req.body.age) < 1 || Number(req.body.age) > 120)) {
+        res.status(400).json({ error: 'Age must be a whole number between 1 and 120' });
+        return;
+      }
+      if (field === 'whatsapp_status' && !['available', 'not_available', 'confirm_later', 'contacted', null].includes(req.body[field])) {
+        res.status(400).json({ error: 'WhatsApp status must be available, not_available, confirm_later, or contacted' });
+        return;
+      }
+      if (field === 'transfer_status' && !['required', 'not_required', 'confirm_later', 'arranged', null].includes(req.body[field])) {
+        res.status(400).json({ error: 'Transfer status must be required, not_required, confirm_later, or arranged' });
+        return;
+      }
+      if (field === 'email' && (typeof req.body.email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(req.body.email.trim()) || req.body.email.trim().length > 120)) {
+        res.status(400).json({ error: 'Enter a valid email address (120 characters or fewer).' });
+        return;
+      }
+      if ((field === 'first_name' || field === 'last_name') && (typeof req.body[field] !== 'string' || !req.body[field].trim() || req.body[field].trim().length > 100)) {
+        res.status(400).json({ error: 'Customer first and last names are required and must be 100 characters or fewer.' });
+        return;
+      }
+      updates.push(`${field} = ?`);
+      let val = req.body[field];
+      if (field === 'medical_waiver_signed') val = val === true || val === 1 ? 1 : 0;
+      if (field === 'needs_accommodation' || field === 'needs_airport_transfer') val = stayFlag(val) ?? 0;
+      if (['arrival_date', 'departure_date', 'flight_arrival_at'].includes(field)) val = val || null;
+      if (['whatsapp', 'whatsapp_status', 'transfer_status', 'flight_number', 'airline_name', 'transportation_requirements', 'hotel_name', 'assigned_driver', 'notes'].includes(field)) {
+        val = optionalText(val);
+      }
+      if (field === 'email') val = val.trim().toLowerCase();
+      if (field === 'first_name' || field === 'last_name') val = String(val).trim().slice(0, 100);
+      values.push(val);
+    }
+  }
+
+  values.push(id);
+  db.prepare(`UPDATE students SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'UPDATE_STUDENT',
+    entityType: 'STUDENT',
+    entityId: id,
+    details: { updatedFields: Object.keys(req.body) },
+    ip: req.ip,
+  });
+
+  res.json({ message: 'Student updated successfully' });
+});
+
+// Update medical waiver status with confirmation and audit
+apiRouter.post('/students/:id/waiver', requireAuth, requireRole(['owner', 'operations_manager', 'front_desk_crm', 'hr']), (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const { signed, date, notes } = req.body;
+
+  if (typeof signed !== 'boolean') {
+    res.status(400).json({ error: 'Signed status must be true or false' });
+    return;
+  }
+  if (signed && date !== undefined && (!isValidDate(date) || date > new Date().toISOString().slice(0, 10))) {
+    res.status(400).json({ error: 'Waiver date must be a valid, non-future date' });
+    return;
+  }
+
+  const student = db.prepare('SELECT id, first_name, last_name FROM students WHERE id = ?').get(id) as any;
+  if (!student) {
+    res.status(404).json({ error: 'Student not found' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE students
+    SET medical_waiver_signed = ?, medical_waiver_date = ?, medical_notes = COALESCE(?, medical_notes), updated_at = ?
+    WHERE id = ?
+  `).run(signed ? 1 : 0, signed ? date || now.slice(0, 10) : null, notes || null, now, id);
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: signed ? 'MEDICAL_WAIVER_SIGNED' : 'MEDICAL_WAIVER_REVOKED',
+    entityType: 'STUDENT_HEALTH',
+    entityId: id,
+    details: { studentName: `${student.first_name} ${student.last_name}`, date: date || now },
+    ip: req.ip,
+  });
+
+  res.json({ success: true, message: 'Medical waiver status updated' });
+});
+
+// ==========================================
+// 4. CRM INQUIRIES & LEADS PIPELINE
+// ==========================================
+
+apiRouter.get('/inquiries', requireAuth, (req: Request, res: Response): void => {
+  const inquiries = db.prepare(`
+    SELECT i.*, u.full_name as assigned_to_name
+    FROM inquiries i
+    LEFT JOIN users u ON i.assigned_to = u.id
+    ORDER BY i.created_at DESC
+  `).all();
+  res.json(inquiries);
+});
+
+apiRouter.post('/inquiries', requireAuth, (req: Request, res: Response): void => {
+  const {
+    student_id,
+    lead_name,
+    lead_email,
+    lead_phone,
+    course_interest,
+    channel,
+    status,
+    message,
+    follow_up_date,
+    assigned_to,
+  } = req.body;
+
+  if (!lead_name) {
+    res.status(400).json({ error: 'Lead name is required' });
+    return;
+  }
+
+  const id = 'inq_' + crypto.randomUUID().slice(0, 10);
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO inquiries (
+      id, student_id, lead_name, lead_email, lead_phone, course_interest,
+      channel, status, message, follow_up_date, assigned_to, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    student_id || null,
+    lead_name,
+    lead_email || null,
+    lead_phone || null,
+    course_interest || null,
+    channel || 'WhatsApp',
+    status || 'new',
+    message || null,
+    follow_up_date || null,
+    assigned_to || req.user!.id,
+    now,
+    now
+  );
+
+  res.status(201).json({ id, message: 'Inquiry logged successfully' });
+});
+
+apiRouter.patch('/inquiries/:id', requireAuth, (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const { status, message, follow_up_date, assigned_to, course_interest } = req.body;
+
+  const updates: string[] = ['updated_at = ?'];
+  const values: any[] = [new Date().toISOString()];
+
+  if (status !== undefined) { updates.push('status = ?'); values.push(status); }
+  if (message !== undefined) { updates.push('message = ?'); values.push(message); }
+  if (follow_up_date !== undefined) { updates.push('follow_up_date = ?'); values.push(follow_up_date); }
+  if (assigned_to !== undefined) { updates.push('assigned_to = ?'); values.push(assigned_to); }
+  if (course_interest !== undefined) { updates.push('course_interest = ?'); values.push(course_interest); }
+
+  values.push(id);
+  db.prepare(`UPDATE inquiries SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+
+  res.json({ message: 'Inquiry updated' });
+});
+
+// ==========================================
+// 5. COURSES, SESSIONS & BOOKINGS
+// ==========================================
+
+apiRouter.get('/courses', requireAuth, (req: Request, res: Response): void => {
+  const courses = db.prepare('SELECT * FROM courses ORDER BY price_eur ASC').all();
+  res.json(courses);
+});
+
+// POS catalogue records are separate from scheduled courses and inventory rentals.
+apiRouter.get('/pos/catalog', requireAuth, requireRole(['owner', 'finance', 'front_desk_crm']), (_req: Request, res: Response): void => {
+  const items = db.prepare(`
+    SELECT ${posCatalogColumns}
+    FROM pos_catalog_items
+    WHERE is_active = 1 AND group_name != 'Gear rental'
+    ORDER BY group_name, name COLLATE NOCASE
+  `).all() as PosCatalogItem[];
+  res.json(items);
+});
+
+apiRouter.post('/pos/catalog', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const parsed = parsePosCatalogItem(req.body);
+  if (!parsed.item) {
+    res.status(400).json({ error: parsed.error });
+    return;
+  }
+  const item = parsed.item;
+  const id = `pos_${crypto.randomUUID().slice(0, 10)}`;
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO pos_catalog_items (
+      id, group_name, name, category, price, price_currency, unit, description,
+      tier_minimum_quantity, tier_unit_price, stay_discount, is_active, created_at, updated_at, created_by, updated_by
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+  `).run(
+    id, item.group, item.name, item.category, item.price, item.price_currency, item.unit, item.description,
+    item.tier_minimum_quantity, item.tier_unit_price, item.stay_discount ? 1 : 0, now, now, req.user!.id, req.user!.id,
+  );
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'CREATE_POS_CATALOG_ITEM',
+    entityType: 'POS_CATALOG_ITEM',
+    entityId: id,
+    details: { name: item.name, group: item.group, price: item.price, currency: item.price_currency },
+    ip: req.ip,
+  });
+  const created = db.prepare(`SELECT ${posCatalogColumns} FROM pos_catalog_items WHERE id = ?`).get(id);
+  res.status(201).json(created);
+});
+
+apiRouter.patch('/pos/catalog/:id', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const existing = db.prepare(`
+    SELECT ${posCatalogColumns}
+    FROM pos_catalog_items
+    WHERE id = ? AND is_active = 1 AND group_name != 'Gear rental'
+  `).get(req.params.id) as PosCatalogItem | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Catalogue item not found' });
+    return;
+  }
+  const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body)
+    ? req.body as Record<string, unknown>
+    : {};
+  const parsed = parsePosCatalogItem({
+    ...existing,
+    ...body,
+    stay_discount: body.stay_discount === undefined ? existing.stay_discount === 1 : body.stay_discount,
+  });
+  if (!parsed.item) {
+    res.status(400).json({ error: parsed.error });
+    return;
+  }
+  const item = parsed.item;
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE pos_catalog_items
+    SET group_name = ?, name = ?, category = ?, price = ?, price_currency = ?, unit = ?, description = ?,
+        tier_minimum_quantity = ?, tier_unit_price = ?, stay_discount = ?, updated_at = ?, updated_by = ?
+    WHERE id = ? AND is_active = 1
+  `).run(
+    item.group, item.name, item.category, item.price, item.price_currency, item.unit, item.description,
+    item.tier_minimum_quantity, item.tier_unit_price, item.stay_discount ? 1 : 0, now, req.user!.id, req.params.id,
+  );
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'UPDATE_POS_CATALOG_ITEM',
+    entityType: 'POS_CATALOG_ITEM',
+    entityId: req.params.id,
+    details: { name: item.name, group: item.group, price: item.price, currency: item.price_currency },
+    ip: req.ip,
+  });
+  const updated = db.prepare(`SELECT ${posCatalogColumns} FROM pos_catalog_items WHERE id = ?`).get(req.params.id);
+  res.json(updated);
+});
+
+apiRouter.delete('/pos/catalog/:id', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const item = db.prepare(`
+    SELECT id, name
+    FROM pos_catalog_items
+    WHERE id = ? AND is_active = 1 AND group_name != 'Gear rental'
+  `).get(req.params.id) as { id: string; name: string } | undefined;
+  if (!item) {
+    res.status(404).json({ error: 'Catalogue item not found' });
+    return;
+  }
+  db.prepare(`
+    UPDATE pos_catalog_items
+    SET is_active = 0, updated_at = ?, updated_by = ?
+    WHERE id = ? AND is_active = 1
+  `).run(new Date().toISOString(), req.user!.id, item.id);
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'ARCHIVE_POS_CATALOG_ITEM',
+    entityType: 'POS_CATALOG_ITEM',
+    entityId: item.id,
+    details: { name: item.name },
+    ip: req.ip,
+  });
+  res.json({ message: 'Catalogue item removed from the POS list' });
+});
+
+apiRouter.post('/courses', requireAuth, requireRole(['owner', 'operations_manager']), (req: Request, res: Response): void => {
+  const { code, title, agency, level, duration_days, max_capacity, price_eur, price_egp, description, prerequisites } = req.body;
+  if (!code || !title || !agency || !level || !price_eur) {
+    res.status(400).json({ error: 'Code, title, agency, level, and price in EUR are required' });
+    return;
+  }
+
+  const id = 'crs_' + crypto.randomUUID().slice(0, 10);
+  db.prepare(`
+    INSERT INTO courses (id, code, title, agency, level, duration_days, max_capacity, price_eur, price_egp, description, prerequisites, is_active, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+  `).run(
+    id,
+    code.trim().toUpperCase(),
+    title.trim(),
+    agency,
+    level,
+    duration_days || 2,
+    max_capacity || 4,
+    Number(price_eur),
+    Number(price_egp) || Number(price_eur) * 52,
+    description || '',
+    prerequisites || '',
+    new Date().toISOString()
+  );
+
+  res.status(201).json({ id, message: 'Course added to catalog' });
+});
+
+apiRouter.get('/sessions', requireAuth, (req: Request, res: Response): void => {
+  const sessions = db.prepare(`
+    SELECT s.*, c.title as course_title, c.code as course_code, c.agency, c.price_eur, c.price_egp, c.prerequisites,
+           u.full_name as instructor_name,
+           (SELECT COUNT(*) FROM bookings b WHERE b.session_id = s.id AND b.status != 'cancelled') as enrolled_count
+    FROM course_sessions s
+    JOIN courses c ON s.course_id = c.id
+    LEFT JOIN users u ON s.instructor_id = u.id
+    ORDER BY s.start_date ASC
+  `).all();
+
+  // If instructor, flag their own assigned sessions
+  res.json(sessions);
+});
+
+apiRouter.post('/sessions', requireAuth, requireRole(['owner', 'operations_manager', 'front_desk_crm']), (req: Request, res: Response): void => {
+  const { course_id, instructor_id, start_date, end_date, location, max_capacity, buoy_count, notes } = req.body;
+  if (!course_id || !start_date || !end_date) {
+    res.status(400).json({ error: 'Course, start date, and end date are required' });
+    return;
+  }
+  if (!Number.isInteger(Number(buoy_count)) || Number(buoy_count) < 1) {
+    res.status(400).json({ error: 'At least one assigned buoy is required before scheduling a session' });
+    return;
+  }
+
+  // Conflict check for assigned instructor
+  if (instructor_id) {
+    const conflict = db.prepare(`
+      SELECT id, start_date, end_date FROM course_sessions
+      WHERE instructor_id = ? AND status != 'cancelled'
+        AND NOT (end_date < ? OR start_date > ?)
+    `).get(instructor_id, start_date, end_date);
+
+    if (conflict) {
+      res.status(409).json({
+        error: 'Instructor conflict detected! This instructor is already assigned to another session during these dates.',
+        conflictSession: conflict,
+      });
+      return;
+    }
+  }
+
+  const id = 'ses_' + crypto.randomUUID().slice(0, 10);
+  db.prepare(`
+    INSERT INTO course_sessions (id, course_id, instructor_id, start_date, end_date, location, status, max_capacity, buoy_count, notes, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?)
+  `).run(
+    id,
+    course_id,
+    instructor_id || null,
+    start_date,
+    end_date,
+    location || 'Lighthouse Bay / Blue Hole',
+    max_capacity || 4,
+    Number(buoy_count),
+    notes || null,
+    new Date().toISOString()
+  );
+
+  res.status(201).json({ id, message: 'Course session scheduled' });
+});
+
+apiRouter.patch('/sessions/:id', requireAuth, requireRole(['owner', 'operations_manager', 'front_desk_crm']), (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const { instructor_id, status, location, notes, max_capacity, buoy_count } = req.body;
+  const session = db.prepare('SELECT max_capacity FROM course_sessions WHERE id = ?').get(id) as { max_capacity: number } | undefined;
+  if (!session) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+
+  const updates: string[] = [];
+  const values: any[] = [];
+
+  if (instructor_id !== undefined) { updates.push('instructor_id = ?'); values.push(instructor_id || null); }
+  if (status !== undefined) { updates.push('status = ?'); values.push(status); }
+  if (location !== undefined) { updates.push('location = ?'); values.push(location); }
+  if (notes !== undefined) { updates.push('notes = ?'); values.push(notes); }
+  if (max_capacity !== undefined) {
+    const maxCapacity = Number(max_capacity);
+    const activeParticipants = (db.prepare("SELECT COUNT(DISTINCT student_id) AS count FROM bookings WHERE session_id = ? AND status != 'cancelled'").get(id) as { count: number }).count;
+    if (!Number.isInteger(maxCapacity) || maxCapacity < 1 || maxCapacity < activeParticipants) {
+      res.status(400).json({ error: `Session capacity must be a positive whole number and cannot be below the current roster (${activeParticipants})` });
+      return;
+    }
+    updates.push('max_capacity = ?');
+    values.push(maxCapacity);
+  }
+  if (buoy_count !== undefined) {
+    const buoyCount = Number(buoy_count);
+    const safetyRules = getBookingSafetyRules();
+    if (!safetyRules) {
+      res.status(503).json({ error: 'Booking safety configuration is invalid; an owner must correct it before changing buoy assignments' });
+      return;
+    }
+    if (!Number.isInteger(buoyCount) || buoyCount < 1) {
+      res.status(400).json({ error: 'Buoy count must be a positive whole number' });
+      return;
+    }
+    const assignments = db.prepare(`
+      SELECT assigned_buoy, COUNT(DISTINCT student_id) AS count
+      FROM bookings
+      WHERE session_id = ? AND status != 'cancelled'
+      GROUP BY assigned_buoy
+    `).all(id) as Array<{ assigned_buoy: number | null; count: number }>;
+    if (assignments.some((assignment) =>
+      assignment.assigned_buoy !== null &&
+      (!Number.isInteger(assignment.assigned_buoy) ||
+       assignment.assigned_buoy < 1 ||
+       assignment.assigned_buoy > buoyCount ||
+       assignment.count > safetyRules.max_divers_per_buoy)
+    )) {
+      res.status(400).json({ error: 'Existing numbered buoy assignments must remain within the new buoy count and per-buoy limit' });
+      return;
+    }
+    updates.push('buoy_count = ?');
+    values.push(buoyCount);
+  }
+
+  if (updates.length === 0) {
+    res.json({ message: 'No updates provided' });
+    return;
+  }
+
+  values.push(id);
+  db.prepare(`UPDATE course_sessions SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+  res.json({ message: 'Session updated' });
+});
+
+apiRouter.get('/bookings', requireAuth, (req: Request, res: Response): void => {
+  const isInstructor = req.user!.role === 'instructor';
+  
+  let query = `
+    SELECT b.*,
+           s.first_name, s.last_name, s.email as student_email, s.phone as student_phone, s.nationality, s.medical_waiver_signed,
+           c.title as course_title, c.code as course_code,
+           cs.start_date, cs.end_date, cs.location, cs.instructor_id,
+           u.full_name as instructor_name
+    FROM bookings b
+    JOIN students s ON b.student_id = s.id
+    JOIN courses c ON b.course_id = c.id
+    LEFT JOIN course_sessions cs ON b.session_id = cs.id
+    LEFT JOIN users u ON cs.instructor_id = u.id
+  `;
+
+  // Instructors only see their own assigned course bookings or general bookings without sensitive pricing
+  const rows = db.prepare(query + ' ORDER BY b.booking_date DESC').all() as any[];
+
+  if (isInstructor) {
+    // Hide payment financial figures from instructors
+    res.json(rows.map(r => ({
+      ...r,
+      price: undefined,
+      payment_status: undefined,
+    })));
+  } else {
+    res.json(rows);
+  }
+});
+
+function normalizeBookingSafetyRules(value: unknown): BookingSafetyRules | null {
+  let rules = value;
+  if (typeof rules === 'string') {
+    try {
+      rules = JSON.parse(rules);
+    } catch {
+      return null;
+    }
+  }
+  if (!rules || typeof rules !== 'object' || Array.isArray(rules)) return null;
+  const candidate = rules as Record<string, unknown>;
+  const waiverDays = candidate.waiver_valid_days;
+  const depositPercent = candidate.minimum_deposit_percent;
+  const diversPerBuoy = candidate.max_divers_per_buoy;
+  const rasMohamedMin = candidate.ras_mohamed_min_participants;
+  if (typeof waiverDays !== 'number' || !Number.isInteger(waiverDays) || waiverDays < 1 || waiverDays > 3650 ||
+      typeof depositPercent !== 'number' || !Number.isFinite(depositPercent) || depositPercent < 1 || depositPercent > 100 ||
+      typeof diversPerBuoy !== 'number' || !Number.isInteger(diversPerBuoy) || diversPerBuoy < 1 || diversPerBuoy > 10 ||
+      typeof rasMohamedMin !== 'number' || !Number.isInteger(rasMohamedMin) || rasMohamedMin < 1 || rasMohamedMin > 100) {
+    return null;
+  }
+  return {
+    waiver_valid_days: waiverDays,
+    minimum_deposit_percent: depositPercent,
+    max_divers_per_buoy: diversPerBuoy,
+    ras_mohamed_min_participants: rasMohamedMin,
+  };
+}
+
+function getBookingSafetyRules(): BookingSafetyRules | null {
+  const stored = db.prepare("SELECT value FROM settings WHERE key = 'booking_safety_rules'").get() as { value: string } | undefined;
+  return stored ? normalizeBookingSafetyRules(stored.value) : null;
+}
+
+function minimumBookingDeposit(totalAmount: number, rules: BookingSafetyRules): number {
+  return Math.ceil(totalAmount * rules.minimum_deposit_percent - 1e-9) / 100;
+}
+
+function getBookingSafetyIssues(
+  student: { medical_waiver_signed: number; medical_waiver_date: string | null; medical_clearance_status: string },
+  course: { prerequisites: string | null },
+  session: { location: string; buoy_count: number },
+  assignedBuoy: number | null,
+  buoyOccupancy: number,
+  totalAmount: number,
+  paidAmount: number,
+  prerequisitesVerified: boolean,
+  rules: BookingSafetyRules,
+): string[] {
+  const issues: string[] = [];
+  const today = new Date();
+  const todayDate = today.toISOString().slice(0, 10);
+  const waiverDate = student.medical_waiver_date;
+  const waiverAge = waiverDate && isValidDate(waiverDate)
+    ? Math.floor((Date.parse(`${todayDate}T00:00:00.000Z`) - Date.parse(`${waiverDate}T00:00:00.000Z`)) / 86_400_000)
+    : null;
+
+  if (student.medical_waiver_signed !== 1 || waiverAge === null || waiverAge < 0 || waiverAge > rules.waiver_valid_days) {
+    issues.push(`A signed waiver dated within the last ${rules.waiver_valid_days} days is required`);
+  }
+  if (!['cleared', 'physician_approved'].includes(student.medical_clearance_status)) {
+    issues.push('Medical clearance is missing; status must be cleared or physician_approved');
+  }
+  if (!Number.isFinite(totalAmount) || totalAmount <= 0 || !Number.isFinite(paidAmount) ||
+      paidAmount + 1e-9 < minimumBookingDeposit(totalAmount, rules)) {
+    issues.push(`A recorded deposit of at least ${rules.minimum_deposit_percent}% of the booking total is required`);
+  }
+  if (course.prerequisites?.trim() && !prerequisitesVerified) {
+    issues.push('Course prerequisites must be reviewed and verified as met');
+  }
+  if (!Number.isInteger(session.buoy_count) || session.buoy_count < 1) {
+    issues.push('An assigned buoy count is required');
+  } else if (!Number.isInteger(assignedBuoy) || assignedBuoy === null || assignedBuoy < 1 || assignedBuoy > session.buoy_count) {
+    issues.push('An explicit buoy assignment within the session buoy count is required');
+  } else if (buoyOccupancy > rules.max_divers_per_buoy) {
+    issues.push(`Buoy ${assignedBuoy} exceeds the limit of ${rules.max_divers_per_buoy} divers`);
+  }
+  return issues;
+}
+
+apiRouter.post('/bookings', requireAuth, requireRole(['owner', 'operations_manager', 'front_desk_crm']), (req: Request, res: Response): void => {
+  const {
+    student_id,
+    course_id,
+    session_id,
+    price,
+    currency,
+    deposit_amount,
+    assigned_buoy,
+    payment_method,
+    payment_date,
+    prerequisites_verified,
+    notes,
+  } = req.body;
+  if (!student_id || !course_id || !session_id) {
+    res.status(400).json({ error: 'Student, course, and scheduled session are required' });
+    return;
+  }
+
+  const student = db.prepare(`
+    SELECT medical_waiver_signed, medical_waiver_date, medical_clearance_status
+    FROM students WHERE id = ?
+  `).get(student_id) as { medical_waiver_signed: number; medical_waiver_date: string | null; medical_clearance_status: string } | undefined;
+  const course = db.prepare('SELECT id, title, prerequisites FROM courses WHERE id = ?').get(course_id) as { id: string; title: string; prerequisites: string | null } | undefined;
+  const session = db.prepare('SELECT * FROM course_sessions WHERE id = ?').get(session_id) as { id: string; course_id: string; location: string; status: string; max_capacity: number; buoy_count: number } | undefined;
+  if (!student || !course || !session || session.course_id !== course_id) {
+    res.status(400).json({ error: 'Student, course, and matching scheduled session must exist' });
+    return;
+  }
+  if (session.status === 'cancelled' || session.status === 'completed') {
+    res.status(409).json({ error: `Cannot book a ${session.status} session` });
+    return;
+  }
+
+  const totalAmount = Number(price);
+  const depositAmount = Number(deposit_amount);
+  const bookingCurrency = String(currency || 'EUR').toUpperCase();
+  const todayDate = new Date().toISOString().slice(0, 10);
+  if (!Number.isFinite(totalAmount) || totalAmount <= 0 || !billingCurrencies.has(bookingCurrency)) {
+    res.status(400).json({ error: 'A positive booking total and supported currency are required' });
+    return;
+  }
+  if (!Number.isFinite(depositAmount) || depositAmount <= 0 || depositAmount > totalAmount ||
+      typeof payment_method !== 'string' || !isValidCashMethod(payment_method, bookingCurrency) ||
+      !isValidDate(payment_date) || payment_date > todayDate) {
+    res.status(400).json({ error: 'A recorded deposit amount, valid payment method, and payment date are required' });
+    return;
+  }
+
+  const duplicate = db.prepare("SELECT id FROM bookings WHERE session_id = ? AND student_id = ? AND status != 'cancelled'").get(session_id, student_id);
+  if (duplicate) {
+    res.status(409).json({ error: 'This student already has an active booking in the selected session' });
+    return;
+  }
+  const currentEnrolled = (db.prepare("SELECT COUNT(DISTINCT student_id) AS count FROM bookings WHERE session_id = ? AND status != 'cancelled'").get(session_id) as { count: number }).count;
+  if (currentEnrolled >= session.max_capacity) {
+    res.status(409).json({ error: `Session is full (Capacity: ${session.max_capacity} students).` });
+    return;
+  }
+  const unassignedEnrolled = (db.prepare(`
+    SELECT COUNT(*) AS count FROM bookings
+    WHERE session_id = ? AND status != 'cancelled' AND assigned_buoy IS NULL
+  `).get(session_id) as { count: number }).count;
+  if (unassignedEnrolled > 0) {
+    res.status(409).json({ error: 'Assign every existing participant to a buoy before adding another diver to this session' });
+    return;
+  }
+
+  const safetyRules = getBookingSafetyRules();
+  if (!safetyRules) {
+    res.status(503).json({ error: 'Booking safety configuration is invalid; an owner must correct it before bookings can be created' });
+    return;
+  }
+  const safetyIssues = getBookingSafetyIssues(
+    student,
+    course,
+    session,
+    Number.isInteger(Number(assigned_buoy)) && Number(assigned_buoy) > 0 ? Number(assigned_buoy) : null,
+    Number.isInteger(Number(assigned_buoy)) && Number(assigned_buoy) > 0 && Number(assigned_buoy) <= session.buoy_count
+      ? (db.prepare("SELECT COUNT(DISTINCT student_id) AS count FROM bookings WHERE session_id = ? AND assigned_buoy = ? AND status != 'cancelled'").get(session_id, Number(assigned_buoy)) as { count: number }).count + 1
+      : 0,
+    totalAmount,
+    depositAmount,
+    prerequisites_verified === true,
+    safetyRules,
+  );
+  if (safetyIssues.length > 0) {
+    res.status(409).json({ error: 'Booking blocked by safety gate', blockers: safetyIssues });
+    return;
+  }
+
+  const id = 'bkg_' + crypto.randomUUID().slice(0, 10);
+  const bookingNumber = `FD-${new Date().getFullYear()}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+  const now = new Date().toISOString();
+
+  const isRasMohamed = /\bras\s+mohamed\b/i.test(session.location);
+  const bookingStatus = isRasMohamed ? 'pending' : 'confirmed';
+  let finalBookingStatus = bookingStatus;
+  const paymentStatus = depositAmount >= totalAmount ? 'paid' : 'partially_paid';
+  const invoiceStatus = paymentStatus === 'paid' ? 'paid' : 'partially_paid';
+  const invoiceId = 'inv_' + crypto.randomUUID().slice(0, 10);
+  const invoiceNumber = `INV-${new Date().getFullYear()}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+  const bookingInsert = db.prepare(`
+    INSERT INTO bookings (
+      id, booking_number, student_id, course_id, session_id, booking_date,
+      status, price, currency, payment_status, prerequisites_verified, assigned_buoy,
+      notes, created_by, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const invoiceInsert = db.prepare(`
+    INSERT INTO invoices (
+      id, invoice_number, student_id, booking_id, issue_date, due_date,
+      currency, subtotal, tax_rate, tax_amount, total_amount, paid_amount,
+      status, notes, created_by, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const itemInsert = db.prepare(`
+    INSERT INTO invoice_items (id, invoice_id, category, description, quantity, unit_price, total_price)
+    VALUES (?, ?, 'course', ?, 1, ?, ?)
+  `);
+  const paymentInsert = db.prepare(`
+    INSERT INTO payments (id, invoice_id, amount, currency, payment_method, payment_date, recorded_by, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const createBooking = db.transaction(() => {
+    bookingInsert.run(
+    id,
+    bookingNumber,
+    student_id,
+    course_id,
+    session_id || null,
+    now.slice(0, 10),
+    bookingStatus,
+    totalAmount,
+    bookingCurrency,
+    paymentStatus,
+    course.prerequisites?.trim() ? 1 : 0,
+    Number(assigned_buoy),
+    notes || null,
+    req.user!.id,
+    now,
+    now
+  );
+
+    invoiceInsert.run(
+      invoiceId,
+      invoiceNumber,
+      student_id,
+      id,
+      now.slice(0, 10),
+      now.slice(0, 10),
+      bookingCurrency,
+      totalAmount,
+      totalAmount,
+      depositAmount,
+      invoiceStatus,
+      `Automatic invoice for ${course.title} booking ${bookingNumber}`,
+      req.user!.id,
+      now,
+      now
+    );
+
+    itemInsert.run(`item_${invoiceId}`, invoiceId, course.title, totalAmount, totalAmount);
+    paymentInsert.run(
+      'pay_' + crypto.randomUUID().slice(0, 10),
+      invoiceId,
+      depositAmount,
+      bookingCurrency,
+      payment_method,
+      payment_date,
+      req.user!.id,
+      now,
+    );
+
+    if (isRasMohamed && currentEnrolled + 1 >= safetyRules.ras_mohamed_min_participants) {
+      const pendingBookings = db.prepare(`
+        SELECT b.id, b.price, b.prerequisites_verified, b.assigned_buoy, s.medical_waiver_signed,
+               s.medical_waiver_date, s.medical_clearance_status, c.prerequisites,
+               cs.location, cs.buoy_count,
+               COALESCE(SUM(COALESCE(p.invoice_amount_cents, ROUND(p.amount * 100)) / 100.0), 0) AS paid_amount
+        FROM bookings b
+        JOIN students s ON s.id = b.student_id
+        JOIN courses c ON c.id = b.course_id
+        JOIN course_sessions cs ON cs.id = b.session_id
+        LEFT JOIN invoices i ON i.booking_id = b.id
+        LEFT JOIN payments p ON p.invoice_id = i.id
+        WHERE b.session_id = ? AND b.status != 'cancelled'
+        GROUP BY b.id
+      `).all(session_id) as Array<{
+        id: string; price: number; prerequisites_verified: number; assigned_buoy: number | null;
+        medical_waiver_signed: number; medical_waiver_date: string | null;
+        medical_clearance_status: string; prerequisites: string | null;
+        location: string; buoy_count: number; paid_amount: number;
+      }>;
+      const participantCount = (db.prepare("SELECT COUNT(DISTINCT student_id) AS count FROM bookings WHERE session_id = ? AND status != 'cancelled'").get(session_id) as { count: number }).count;
+      const buoyOccupancies = db.prepare(`
+        SELECT assigned_buoy, COUNT(DISTINCT student_id) AS count
+        FROM bookings WHERE session_id = ? AND status != 'cancelled'
+        GROUP BY assigned_buoy
+      `).all(session_id) as Array<{ assigned_buoy: number | null; count: number }>;
+      const occupancyByBuoy = new Map(
+        buoyOccupancies
+          .filter((occupancy): occupancy is { assigned_buoy: number; count: number } => occupancy.assigned_buoy !== null)
+          .map((occupancy) => [occupancy.assigned_buoy, occupancy.count]),
+      );
+      const groupIssues = pendingBookings.flatMap((booking) => getBookingSafetyIssues(
+        booking,
+        booking,
+        booking,
+        booking.assigned_buoy,
+        booking.assigned_buoy === null ? 0 : occupancyByBuoy.get(booking.assigned_buoy) || 0,
+        booking.price,
+        booking.paid_amount,
+        booking.prerequisites_verified === 1,
+        safetyRules,
+      ));
+      if (groupIssues.length === 0 && participantCount >= safetyRules.ras_mohamed_min_participants) {
+        db.prepare("UPDATE bookings SET status = 'confirmed', updated_at = ? WHERE session_id = ? AND status = 'pending'")
+          .run(now, session_id);
+        finalBookingStatus = 'confirmed';
+      }
+    }
+  });
+  createBooking();
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'CREATE_BOOKING',
+    entityType: 'BOOKING',
+    entityId: id,
+    details: { bookingNumber, student_id, course_id, price: totalAmount, deposit_amount: depositAmount, status: finalBookingStatus },
+    ip: req.ip,
+  });
+
+  res.status(201).json({
+    id,
+    bookingNumber,
+    invoiceId,
+    status: finalBookingStatus,
+    message: finalBookingStatus === 'confirmed'
+      ? 'Booking confirmed and deposit recorded'
+      : `Booking is pending until at least ${safetyRules.ras_mohamed_min_participants} participants are enrolled for Ras Mohamed`,
+  });
+});
+
+apiRouter.patch('/bookings/:id', requireAuth, requireRole(['owner', 'operations_manager', 'front_desk_crm']), (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const { status, notes, session_id, assigned_buoy } = req.body;
+  if (req.body.payment_status !== undefined) {
+    res.status(400).json({ error: 'Payment status is derived from recorded invoice payments' });
+    return;
+  }
+  const booking = db.prepare(`
+    SELECT b.*, s.medical_waiver_signed, s.medical_waiver_date,
+           s.medical_clearance_status, c.prerequisites, cs.location, cs.buoy_count,
+           cs.max_capacity, cs.status AS session_status,
+           COALESCE((SELECT SUM(COALESCE(p.invoice_amount_cents, ROUND(p.amount * 100)) / 100.0)
+                     FROM invoices i JOIN payments p ON p.invoice_id = i.id WHERE i.booking_id = b.id), 0) AS paid_amount
+    FROM bookings b
+    JOIN students s ON s.id = b.student_id
+    JOIN courses c ON c.id = b.course_id
+    JOIN course_sessions cs ON cs.id = COALESCE(?, b.session_id)
+    WHERE b.id = ?
+  `).get(session_id || null, id) as any;
+  if (!booking) {
+    res.status(404).json({ error: 'Booking or scheduled session not found' });
+    return;
+  }
+  if (status !== undefined && !['pending', 'confirmed', 'attended', 'certified', 'cancelled'].includes(status)) {
+    res.status(400).json({ error: 'Invalid booking status' });
+    return;
+  }
+  if (session_id !== undefined && session_id !== booking.session_id) {
+    res.status(409).json({ error: 'Moving an existing booking to another session is not supported by the safety gate' });
+    return;
+  }
+  const effectiveBuoy = assigned_buoy === undefined ? booking.assigned_buoy : Number(assigned_buoy);
+  let safetyRules: BookingSafetyRules | null = null;
+  if (assigned_buoy !== undefined) {
+    safetyRules = getBookingSafetyRules();
+    if (!safetyRules) {
+      res.status(503).json({ error: 'Booking safety configuration is invalid; an owner must correct it before changing buoy assignments' });
+      return;
+    }
+    if (!Number.isInteger(effectiveBuoy) || effectiveBuoy < 1 || effectiveBuoy > booking.buoy_count) {
+      res.status(400).json({ error: 'Choose a buoy number within the session buoy count' });
+      return;
+    }
+    const otherOccupants = (db.prepare(`
+      SELECT COUNT(DISTINCT student_id) AS count FROM bookings
+      WHERE session_id = ? AND assigned_buoy = ? AND status != 'cancelled' AND id != ?
+    `).get(booking.session_id, effectiveBuoy, id) as { count: number }).count;
+    if (otherOccupants + 1 > safetyRules.max_divers_per_buoy) {
+      res.status(409).json({ error: `Buoy ${effectiveBuoy} is full (maximum ${safetyRules.max_divers_per_buoy} divers)` });
+      return;
+    }
+  }
+  if (status !== undefined && ['confirmed', 'attended', 'certified'].includes(status)) {
+    safetyRules = safetyRules || getBookingSafetyRules();
+    if (!safetyRules) {
+      res.status(503).json({ error: 'Booking safety configuration is invalid; an owner must correct it before bookings can be confirmed' });
+      return;
+    }
+    const buoyOccupancy = Number.isInteger(effectiveBuoy) && effectiveBuoy !== null
+      ? (db.prepare(`
+        SELECT COUNT(DISTINCT student_id) AS count FROM bookings
+        WHERE session_id = ? AND assigned_buoy = ? AND status != 'cancelled'
+      `).get(booking.session_id, effectiveBuoy) as { count: number }).count
+      : 0;
+    const safetyIssues = getBookingSafetyIssues(
+      booking,
+      booking,
+      booking,
+      effectiveBuoy,
+      buoyOccupancy,
+      booking.price,
+      booking.paid_amount,
+      booking.prerequisites_verified === 1,
+      safetyRules,
+    );
+    if (safetyIssues.length > 0) {
+      res.status(409).json({ error: 'Booking blocked by safety gate', blockers: safetyIssues });
+      return;
+    }
+    const activeCount = (db.prepare("SELECT COUNT(DISTINCT student_id) AS count FROM bookings WHERE session_id = ? AND status != 'cancelled'").get(booking.session_id) as { count: number }).count;
+    if (/\bras\s+mohamed\b/i.test(booking.location) && activeCount < safetyRules.ras_mohamed_min_participants) {
+      res.status(409).json({ error: `Ras Mohamed bookings require at least ${safetyRules.ras_mohamed_min_participants} participants before confirmation` });
+      return;
+    }
+  }
+
+  const updates: string[] = ['updated_at = ?'];
+  const values: any[] = [new Date().toISOString()];
+
+  if (status !== undefined) { updates.push('status = ?'); values.push(status); }
+  if (notes !== undefined) { updates.push('notes = ?'); values.push(notes); }
+  if (session_id !== undefined) { updates.push('session_id = ?'); values.push(session_id || null); }
+  if (assigned_buoy !== undefined) { updates.push('assigned_buoy = ?'); values.push(Number(assigned_buoy)); }
+
+  values.push(id);
+  db.prepare(`UPDATE bookings SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+
+  res.json({ message: 'Booking updated' });
+});
+
+// ==========================================
+// 6. DAILY DAHAB ACTIVITY BOARD & OCEAN OPS
+// ==========================================
+
+apiRouter.get('/activities', requireAuth, (req: Request, res: Response): void => {
+  const { date } = req.query;
+  let query = `
+    SELECT a.*, u.full_name as lead_instructor_name
+    FROM daily_activities a
+    LEFT JOIN users u ON a.lead_instructor_id = u.id
+  `;
+  const params: any[] = [];
+  if (date) {
+    query += ' WHERE a.activity_date = ?';
+    params.push(date);
+  }
+  query += ' ORDER BY a.activity_date DESC, a.start_time ASC';
+
+  const activities = db.prepare(query).all(...params) as any[];
+
+  // Attach participant rosters to each activity
+  const getParticipants = db.prepare(`
+    SELECT ap.*, s.first_name, s.last_name, s.certification_agency, s.certification_level, s.medical_waiver_signed
+    FROM activity_participants ap
+    JOIN students s ON ap.student_id = s.id
+    WHERE ap.activity_id = ?
+  `);
+
+  const enriched = activities.map((act) => ({
+    ...act,
+    participants: getParticipants.all(act.id),
+  }));
+
+  res.json(enriched);
+});
+
+apiRouter.post('/activities', requireAuth, requireRole(['owner', 'operations_manager', 'instructor']), (req: Request, res: Response): void => {
+  const {
+    title,
+    activity_type,
+    location,
+    activity_date,
+    start_time,
+    end_time,
+    lead_instructor_id,
+    safety_diver_name,
+    max_depth_target,
+    max_pax,
+    sea_conditions,
+    notes,
+  } = req.body;
+
+  if (!title || !location || !activity_date || !start_time || !end_time) {
+    res.status(400).json({ error: 'Title, location, date, start time, and end time are required' });
+    return;
+  }
+
+  const id = 'act_' + crypto.randomUUID().slice(0, 10);
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO daily_activities (
+      id, title, activity_type, location, activity_date, start_time, end_time,
+      lead_instructor_id, safety_diver_name, max_depth_target, max_pax, current_pax,
+      status, sea_conditions, notes, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'planned', ?, ?, ?)
+  `).run(
+    id,
+    title,
+    activity_type || 'depth_training',
+    location,
+    activity_date,
+    start_time,
+    end_time,
+    lead_instructor_id || null,
+    safety_diver_name || null,
+    Number(max_depth_target) || 0,
+    Number(max_pax) || 6,
+    sea_conditions || 'Calm, 24°C, 30m visibility',
+    notes || null,
+    now
+  );
+
+  res.status(201).json({ id, message: 'Dahab ocean activity scheduled' });
+});
+
+apiRouter.patch('/activities/:id', requireAuth, (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const { status, sea_conditions, notes, lead_instructor_id, safety_diver_name, current_pax } = req.body;
+  const activity = db.prepare('SELECT location FROM daily_activities WHERE id = ?').get(id) as { location: string } | undefined;
+  if (!activity) {
+    res.status(404).json({ error: 'Activity not found' });
+    return;
+  }
+  if (status === 'in_water' && /\bras\s+mohamed\b/i.test(activity.location)) {
+    const safetyRules = getBookingSafetyRules();
+    if (!safetyRules) {
+      res.status(503).json({ error: 'Booking safety configuration is invalid; an owner must correct it before ocean activities can start' });
+      return;
+    }
+    const participants = (db.prepare(`
+      SELECT COUNT(DISTINCT student_id) AS count FROM activity_participants
+      WHERE activity_id = ? AND attendance_status != 'no_show'
+    `).get(id) as { count: number }).count;
+    if (participants < safetyRules.ras_mohamed_min_participants) {
+      res.status(409).json({ error: `Ras Mohamed activities require at least ${safetyRules.ras_mohamed_min_participants} registered participants before entering the water` });
+      return;
+    }
+  }
+
+  const updates: string[] = [];
+  const values: any[] = [];
+
+  if (status !== undefined) { updates.push('status = ?'); values.push(status); }
+  if (sea_conditions !== undefined) { updates.push('sea_conditions = ?'); values.push(sea_conditions); }
+  if (notes !== undefined) { updates.push('notes = ?'); values.push(notes); }
+  if (lead_instructor_id !== undefined) { updates.push('lead_instructor_id = ?'); values.push(lead_instructor_id); }
+  if (safety_diver_name !== undefined) { updates.push('safety_diver_name = ?'); values.push(safety_diver_name); }
+  if (current_pax !== undefined) { updates.push('current_pax = ?'); values.push(Number(current_pax)); }
+
+  if (updates.length === 0) {
+    res.json({ message: 'No updates provided' });
+    return;
+  }
+
+  values.push(id);
+  db.prepare(`UPDATE daily_activities SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+  res.json({ message: 'Activity board updated' });
+});
+
+apiRouter.post('/activities/:id/participants', requireAuth, (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const { student_id, attendance_status, depth_achieved, notes } = req.body;
+
+  if (!student_id) {
+    res.status(400).json({ error: 'Student ID required' });
+    return;
+  }
+  const activity = db.prepare('SELECT max_pax FROM daily_activities WHERE id = ?').get(id) as { max_pax: number } | undefined;
+  if (!activity) {
+    res.status(404).json({ error: 'Activity not found' });
+    return;
+  }
+  const existing = db.prepare('SELECT id FROM activity_participants WHERE activity_id = ? AND student_id = ?').get(id, student_id);
+  if (existing) {
+    res.status(409).json({ error: 'This student is already registered for the activity' });
+    return;
+  }
+  const currentParticipants = (db.prepare(`
+    SELECT COUNT(DISTINCT student_id) AS count FROM activity_participants
+    WHERE activity_id = ? AND attendance_status != 'no_show'
+  `).get(id) as { count: number }).count;
+  if (currentParticipants >= activity.max_pax) {
+    res.status(409).json({ error: `Activity is full (Capacity: ${activity.max_pax} participants)` });
+    return;
+  }
+
+  const partId = 'ap_' + crypto.randomUUID().slice(0, 10);
+  db.prepare(`
+    INSERT INTO activity_participants (id, activity_id, student_id, attendance_status, depth_achieved, notes)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(partId, id, student_id, attendance_status || 'checked_in', Number(depth_achieved) || 0, notes || null);
+
+  // Update current_pax count
+  const count = (db.prepare('SELECT COUNT(*) as c FROM activity_participants WHERE activity_id = ?').get(id) as any).c;
+  db.prepare('UPDATE daily_activities SET current_pax = ? WHERE id = ?').run(count, id);
+
+  res.status(201).json({ id: partId, message: 'Participant added to ocean session' });
+});
+
+// ==========================================
+// 7. FINANCE & BILLING MODULE (Strict Auth)
+// ==========================================
+
+const customerRequestRoles: Array<'owner' | 'finance' | 'front_desk_crm'> = ['owner', 'finance', 'front_desk_crm'];
+const plannerAccommodationRoles: Array<'owner' | 'finance' | 'front_desk_crm' | 'operations_manager'> = [
+  'owner', 'finance', 'front_desk_crm', 'operations_manager',
+];
+const customerRequestCategories = new Set(['course', 'package', 'accommodation', 'activity', 'workshop', 'training', 'gear_rental', 'shop', 'other']);
+const financeCurrencies = ['EUR', 'USD', 'EGP', 'GBP'] as const;
+type FinanceCurrency = (typeof financeCurrencies)[number];
+type FinanceFxRates = Record<FinanceCurrency, number | null>;
+const billingCurrencies = new Set<string>(financeCurrencies);
+const paymentMethods = new Set(['Cash EUR', 'Cash EGP', 'Cash USD', 'Cash GBP', 'Credit Card', 'Bank Transfer', 'InstaPay Egypt']);
+const financeFxRatesSettingKey = 'finance_fx_rates_to_eur';
+
+interface FinanceFxRatesSetting {
+  rates_to_eur: FinanceFxRates;
+  updated_at: string | null;
+  updated_by_name: string | null;
+}
+
+function getFinanceFxRates(): FinanceFxRatesSetting | null {
+  const stored = db.prepare('SELECT value FROM settings WHERE key = ?').get(financeFxRatesSettingKey) as { value: string } | undefined;
+  if (!stored) {
+    return {
+      rates_to_eur: { EUR: 1, USD: null, EGP: null, GBP: null },
+      updated_at: null,
+      updated_by_name: null,
+    };
+  }
+  try {
+    const parsed: unknown = JSON.parse(stored.value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const setting = parsed as Record<string, unknown>;
+    const rawRates = setting.rates_to_eur;
+    if (!rawRates || typeof rawRates !== 'object' || Array.isArray(rawRates)) return null;
+    const rates = rawRates as Record<string, unknown>;
+    if (rates.EUR !== 1 || !financeCurrencies.slice(1).every((currency) =>
+      rates[currency] === null ||
+      (typeof rates[currency] === 'number' && Number.isFinite(rates[currency]) && rates[currency] > 0),
+    )) return null;
+    return {
+      rates_to_eur: {
+        EUR: 1,
+        USD: rates.USD as number | null,
+        EGP: rates.EGP as number | null,
+        GBP: rates.GBP as number | null,
+      },
+      updated_at: typeof setting.updated_at === 'string' ? setting.updated_at : null,
+      updated_by_name: typeof setting.updated_by_name === 'string' ? setting.updated_by_name : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getPaymentCurrencyAmounts(
+  amountCents: number,
+  paymentCurrency: FinanceCurrency,
+  invoiceCurrency: FinanceCurrency,
+  rates: FinanceFxRates,
+): { invoiceAmountCents: number; eurAmountCents: number | null; rateToEur: number | null } | string {
+  const paymentRate = rates[paymentCurrency];
+  const invoiceRate = rates[invoiceCurrency];
+  if (paymentCurrency === invoiceCurrency) {
+    return {
+      invoiceAmountCents: amountCents,
+      eurAmountCents: paymentRate === null ? null : Math.round(amountCents * paymentRate),
+      rateToEur: paymentRate,
+    };
+  }
+  if (paymentRate === null || invoiceRate === null) {
+    return `Set EUR conversion rates for ${paymentCurrency} and ${invoiceCurrency} before recording this payment`;
+  }
+  const eurAmountCents = Math.round(amountCents * paymentRate);
+  return {
+    invoiceAmountCents: Math.round(eurAmountCents / invoiceRate),
+    eurAmountCents,
+    rateToEur: paymentRate,
+  };
+}
+
+function isValidDate(value: unknown): value is string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+function getAccommodationNights(checkIn: string, checkOut: string): number {
+  return (Date.parse(`${checkOut}T00:00:00.000Z`) - Date.parse(`${checkIn}T00:00:00.000Z`)) / 86_400_000;
+}
+
+function isValidLocalDateTime(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value);
+  if (!match) return false;
+  const [, year, month, day, hour, minute] = match.map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day, hour, minute));
+  return parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() === month - 1 &&
+    parsed.getUTCDate() === day &&
+    parsed.getUTCHours() === hour &&
+    parsed.getUTCMinutes() === minute;
+}
+
+type StayDetails = {
+  whatsapp?: unknown;
+  arrival_date?: unknown;
+  departure_date?: unknown;
+  needs_accommodation?: unknown;
+  needs_airport_transfer?: unknown;
+  flight_number?: unknown;
+  airline_name?: unknown;
+  flight_arrival_at?: unknown;
+  transportation_requirements?: unknown;
+  hotel_name?: unknown;
+  assigned_driver?: unknown;
+  notes?: unknown;
+};
+
+function validateStayDetails(details: StayDetails): string | null {
+  const {
+    arrival_date,
+    departure_date,
+    needs_accommodation,
+    needs_airport_transfer,
+    flight_arrival_at,
+  } = details;
+  const textFields = [
+    ['WhatsApp number', details.whatsapp, 60],
+    ['Flight number', details.flight_number, 50],
+    ['Airline name', details.airline_name, 100],
+    ['Transportation requirements', details.transportation_requirements, 1000],
+    ['Hotel name', details.hotel_name, 150],
+    ['Assigned driver', details.assigned_driver, 150],
+    ['Comments', details.notes, 4000],
+  ] as const;
+  for (const [label, value, maxLength] of textFields) {
+    if (value !== undefined && value !== null && typeof value !== 'string') {
+      return `${label} must be text`;
+    }
+    if (typeof value === 'string' && value.trim().length > maxLength) {
+      return `${label} must be ${maxLength} characters or fewer`;
+    }
+  }
+  for (const [label, value] of [['Arrival date', arrival_date], ['Check-out date', departure_date]] as const) {
+    if (value !== undefined && value !== null && value !== '' && !isValidDate(value)) {
+      return `${label} must be a valid calendar date`;
+    }
+  }
+  if (flight_arrival_at !== undefined && flight_arrival_at !== null && flight_arrival_at !== '' && !isValidLocalDateTime(flight_arrival_at)) {
+    return 'Flight arrival date and time must be valid';
+  }
+  for (const [label, value] of [['Accommodation', needs_accommodation], ['Airport transfer', needs_airport_transfer]] as const) {
+    if (value !== undefined && typeof value !== 'boolean' && value !== 0 && value !== 1) {
+      return `${label} must be yes or no`;
+    }
+  }
+  if (isValidDate(arrival_date) && isValidDate(departure_date) && departure_date < arrival_date) {
+    return 'Check-out date cannot be before the arrival date';
+  }
+  return null;
+}
+
+function optionalText(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function stayFlag(value: unknown): number | null {
+  if (value === true || value === 1) return 1;
+  if (value === false || value === 0) return 0;
+  return null;
+}
+
+function isValidCashMethod(method: unknown, currency: string): boolean {
+  return typeof method === 'string' &&
+    paymentMethods.has(method) &&
+    (!method.startsWith('Cash ') || method === `Cash ${currency}`);
+}
+
+type PaymentAllocationInput = {
+  item_id?: unknown;
+  item_index?: unknown;
+  beneficiary_student_id?: unknown;
+  amount?: unknown;
+};
+
+type ResolvedPaymentAllocation = {
+  itemId: string;
+  serviceLabel: string;
+  serviceCategory: string;
+  beneficiaryStudentId: string;
+  amountCents: number;
+};
+
+type PaymentAllocationItem = {
+  id: string;
+  description: string;
+  category: string;
+  capacityCents: number;
+  usedCents: number;
+};
+
+function getInvoicePaymentItems(invoiceId: string): PaymentAllocationItem[] {
+  const invoice = db.prepare('SELECT total_amount FROM invoices WHERE id = ?').get(invoiceId) as { total_amount: number } | undefined;
+  if (!invoice) return [];
+  const items = db.prepare(`
+    SELECT id, description, category, ROUND(total_price * 100) AS line_cents
+    FROM invoice_items WHERE invoice_id = ?
+  `).all(invoiceId) as Array<{ id: string; description: string; category: string; line_cents: number }>;
+  if (!items.length) return [];
+
+  const weightTotal = items.reduce((sum, item) => sum + item.line_cents, 0);
+  const totalCents = Math.round(invoice.total_amount * 100);
+  const capacities = items.map((item) => {
+    const raw = weightTotal > 0 ? totalCents * item.line_cents / weightTotal : totalCents / items.length;
+    return { id: item.id, capacity: Math.floor(raw), remainder: raw - Math.floor(raw) };
+  });
+  let unassignedCents = totalCents - capacities.reduce((sum, item) => sum + item.capacity, 0);
+  for (const capacity of [...capacities].sort((a, b) => b.remainder - a.remainder || a.id.localeCompare(b.id))) {
+    if (unassignedCents <= 0) break;
+    capacity.capacity += 1;
+    unassignedCents -= 1;
+  }
+
+  const grossUsage = db.prepare(`
+    SELECT pa.invoice_item_id, pa.service_label, pa.service_category,
+           SUM(pa.amount_cents) AS amount_cents
+    FROM payment_allocations pa
+    JOIN payments p ON p.id = pa.payment_id
+    WHERE p.invoice_id = ?
+    GROUP BY pa.invoice_item_id, pa.service_label, pa.service_category
+  `).all(invoiceId) as Array<{
+    invoice_item_id: string | null;
+    service_label: string;
+    service_category: string;
+    amount_cents: number;
+  }>;
+  const adjustmentUsage = db.prepare(`
+    SELECT COALESCE(paa.invoice_item_id, original.invoice_item_id) AS invoice_item_id,
+           COALESCE(paa.service_label, original.service_label) AS service_label,
+           COALESCE(paa.service_category, original.service_category) AS service_category,
+           SUM(CASE WHEN pa.direction = 'debit' THEN -paa.amount_cents ELSE paa.amount_cents END) AS amount_cents
+    FROM payment_adjustment_allocations paa
+    JOIN payment_adjustments pa ON pa.id = paa.adjustment_id
+    LEFT JOIN payment_allocations original ON original.id = paa.payment_allocation_id
+    JOIN payments p ON p.id = pa.payment_id
+    WHERE p.invoice_id = ?
+    GROUP BY COALESCE(paa.invoice_item_id, original.invoice_item_id),
+             COALESCE(paa.service_label, original.service_label),
+             COALESCE(paa.service_category, original.service_category)
+  `).all(invoiceId) as Array<{
+    invoice_item_id: string | null;
+    service_label: string;
+    service_category: string;
+    amount_cents: number;
+  }>;
+  const itemsByService = new Map<string, typeof items>();
+  for (const item of items) {
+    const key = `${item.category}\u0000${item.description}`;
+    itemsByService.set(key, [...(itemsByService.get(key) || []), item]);
+  }
+  const usedByItem = new Map<string, number>();
+  const addUsage = (row: typeof grossUsage[number] | typeof adjustmentUsage[number]) => {
+    const matchingItems = row.invoice_item_id
+      ? undefined
+      : itemsByService.get(`${row.service_category}\u0000${row.service_label}`);
+    const itemId = row.invoice_item_id || (matchingItems?.length === 1 ? matchingItems[0].id : null);
+    if (itemId) usedByItem.set(itemId, (usedByItem.get(itemId) || 0) + row.amount_cents);
+  };
+  for (const row of grossUsage) addUsage(row);
+  for (const row of adjustmentUsage) addUsage(row);
+  return items.map((item) => ({
+    id: item.id,
+    description: item.description,
+    category: item.category,
+    capacityCents: capacities.find((capacity) => capacity.id === item.id)?.capacity || 0,
+    usedCents: usedByItem.get(item.id) || 0,
+  }));
+}
+
+function normalizePaymentAllocations(
+  input: unknown,
+  items: PaymentAllocationItem[],
+  expectedCents: number,
+  defaultBeneficiaryId?: string,
+): ResolvedPaymentAllocation[] | string {
+  if (!Array.isArray(input) || input.length === 0 || input.length > 30) {
+    return 'Allocate the payment to at least one invoice service';
+  }
+  const seen = new Set<string>();
+  const allocations: ResolvedPaymentAllocation[] = [];
+  const requestedByItem = new Map<string, number>();
+  let totalCents = 0;
+  for (const raw of input as PaymentAllocationInput[]) {
+    const item = typeof raw.item_id === 'string'
+      ? items.find((candidate) => candidate.id === raw.item_id)
+      : Number.isInteger(raw.item_index)
+        ? items[Number(raw.item_index)]
+        : undefined;
+    const beneficiaryStudentId = typeof raw.beneficiary_student_id === 'string'
+      ? raw.beneficiary_student_id
+      : defaultBeneficiaryId;
+    const amount = Number(raw.amount);
+    const amountCents = Math.round(amount * 100);
+    if (!item || !beneficiaryStudentId || !Number.isFinite(amount) || amountCents <= 0 ||
+      Math.abs(amount * 100 - amountCents) > 0.00001) {
+      return 'Each allocation needs a valid service, beneficiary, and amount';
+    }
+    const key = `${item.id}:${beneficiaryStudentId}`;
+    if (seen.has(key)) return 'Combine duplicate service and beneficiary allocations';
+    seen.add(key);
+    if (!db.prepare('SELECT 1 FROM students WHERE id = ?').get(beneficiaryStudentId)) {
+      return 'Allocation beneficiary not found';
+    }
+    allocations.push({
+      itemId: item.id,
+      serviceLabel: item.description,
+      serviceCategory: item.category,
+      beneficiaryStudentId,
+      amountCents,
+    });
+    requestedByItem.set(item.id, (requestedByItem.get(item.id) || 0) + amountCents);
+    totalCents += amountCents;
+  }
+  if (totalCents !== expectedCents) return 'Service allocations must equal the payment amount exactly';
+  for (const item of items) {
+    const requested = requestedByItem.get(item.id) || 0;
+    if (requested > 0 && item.usedCents + requested > item.capacityCents) {
+      return `Allocation exceeds the remaining amount for ${item.description}`;
+    }
+  }
+  return allocations;
+}
+
+function autoAllocatePayment(
+  items: PaymentAllocationItem[],
+  expectedCents: number,
+  beneficiaryStudentId: string,
+): ResolvedPaymentAllocation[] | string {
+  let remainingCents = expectedCents;
+  const allocations: ResolvedPaymentAllocation[] = [];
+  for (const item of items) {
+    const availableCents = Math.max(0, item.capacityCents - item.usedCents);
+    const amountCents = Math.min(remainingCents, availableCents);
+    if (amountCents <= 0) continue;
+    allocations.push({
+      itemId: item.id,
+      serviceLabel: item.description,
+      serviceCategory: item.category,
+      beneficiaryStudentId,
+      amountCents,
+    });
+    remainingCents -= amountCents;
+    if (remainingCents === 0) break;
+  }
+  if (remainingCents > 0) {
+    return 'The invoice services do not have enough remaining balance for this payment';
+  }
+  return allocations;
+}
+
+function insertPaymentAllocations(paymentId: string, allocations: ResolvedPaymentAllocation[], createdAt: string): void {
+  const insert = db.prepare(`
+    INSERT INTO payment_allocations (
+      id, payment_id, invoice_item_id, service_label, service_category,
+      beneficiary_student_id, amount_cents, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const allocation of allocations) {
+    insert.run(
+      `palloc_${crypto.randomUUID()}`,
+      paymentId,
+      allocation.itemId,
+      allocation.serviceLabel,
+      allocation.serviceCategory,
+      allocation.beneficiaryStudentId,
+      allocation.amountCents,
+      createdAt,
+    );
+  }
+}
+
+type FinanceCategories = { expense: string[]; billing: string[]; income: string[] };
+
+function getFinanceCategories(): FinanceCategories | null {
+  const stored = db.prepare("SELECT value FROM settings WHERE key = 'finance_categories'").get() as { value: string } | undefined;
+  if (!stored) return null;
+  try {
+    const parsed: unknown = JSON.parse(stored.value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const categories = parsed as Record<string, unknown>;
+    if (!['expense', 'billing', 'income'].every((key) =>
+      Array.isArray(categories[key]) &&
+      (categories[key] as unknown[]).every((item) => typeof item === 'string' && item.trim().length > 0),
+    )) return null;
+    return {
+      expense: [...categories.expense as string[]],
+      billing: [...categories.billing as string[]],
+      income: [...categories.income as string[]],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isValidFinanceAccount(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 100;
+}
+
+function enrichPayments(payments: any[]): any[] {
+  if (payments.length === 0) return [];
+  const paymentIds = payments.map((payment) => payment.id);
+  const placeholders = paymentIds.map(() => '?').join(', ');
+  const allocations = db.prepare(`
+    SELECT pa.*, s.first_name AS beneficiary_first_name, s.last_name AS beneficiary_last_name
+    FROM payment_allocations pa
+    LEFT JOIN students s ON s.id = pa.beneficiary_student_id
+    WHERE pa.payment_id IN (${placeholders})
+    ORDER BY pa.created_at, pa.id
+  `).all(...paymentIds) as any[];
+  const adjustments = db.prepare(`
+    SELECT pa.*, u.full_name AS recorded_by_name
+    FROM payment_adjustments pa
+    LEFT JOIN users u ON u.id = pa.recorded_by
+    WHERE pa.payment_id IN (${placeholders})
+    ORDER BY pa.adjustment_date, pa.created_at
+  `).all(...paymentIds) as any[];
+  const adjustmentIds = adjustments.map((adjustment) => adjustment.id);
+  const adjustmentAllocations = adjustmentIds.length
+    ? db.prepare(`
+        SELECT paa.*, s.first_name AS beneficiary_first_name, s.last_name AS beneficiary_last_name
+        FROM payment_adjustment_allocations paa
+        LEFT JOIN students s ON s.id = paa.beneficiary_student_id
+        WHERE paa.adjustment_id IN (${adjustmentIds.map(() => '?').join(', ')})
+        ORDER BY paa.created_at, paa.id
+      `).all(...adjustmentIds) as any[]
+    : [];
+  const adjustmentAllocationsById = new Map<string, any[]>();
+  for (const allocation of adjustmentAllocations) {
+    const list = adjustmentAllocationsById.get(allocation.adjustment_id) || [];
+    list.push(allocation);
+    adjustmentAllocationsById.set(allocation.adjustment_id, list);
+  }
+  const allocationsByPayment = new Map<string, any[]>();
+  const adjustmentsByPayment = new Map<string, any[]>();
+  for (const allocation of allocations) {
+    const list = allocationsByPayment.get(allocation.payment_id) || [];
+    list.push(allocation);
+    allocationsByPayment.set(allocation.payment_id, list);
+  }
+  for (const adjustment of adjustments) {
+    const list = adjustmentsByPayment.get(adjustment.payment_id) || [];
+    list.push(adjustment);
+    adjustmentsByPayment.set(adjustment.payment_id, list);
+  }
+  return payments.map((payment) => {
+    const paymentAdjustments = (adjustmentsByPayment.get(payment.id) || []).map((adjustment) => ({
+      ...adjustment,
+      allocations: adjustmentAllocationsById.get(adjustment.id) || [],
+    }));
+    const netCents = Math.round(payment.amount * 100) + paymentAdjustments.reduce(
+        (total, adjustment) => total + (adjustment.direction === 'credit'
+          ? adjustment.cash_amount_cents ?? adjustment.amount_cents
+          : -(adjustment.cash_amount_cents ?? adjustment.amount_cents)),
+      0,
+    );
+      const invoiceNetCents = Number(payment.invoice_amount_cents ?? Math.round(payment.amount * 100)) +
+        paymentAdjustments.reduce(
+          (total, adjustment) => total + (adjustment.direction === 'credit' ? adjustment.amount_cents : -adjustment.amount_cents),
+          0,
+        );
+    return {
+      ...payment,
+      allocations: allocationsByPayment.get(payment.id) || [],
+      adjustments: paymentAdjustments,
+      net_amount: netCents / 100,
+        invoice_net_amount_cents: invoiceNetCents,
+    };
+  });
+}
+
+apiRouter.get('/customer-requests', requireAuth, requireRole(customerRequestRoles), (req: Request, res: Response): void => {
+  const requests = db.prepare(`
+    SELECT cr.id AS request_id, cr.request_number, cr.special_request,
+           inv.*, s.first_name, s.last_name, s.email AS student_email, s.phone AS student_phone
+    FROM customer_requests cr
+    JOIN invoices inv ON cr.invoice_id = inv.id
+    JOIN students s ON inv.student_id = s.id
+    ORDER BY cr.created_at DESC
+    LIMIT 250
+  `).all() as any[];
+
+  if (requests.length === 0) {
+    res.json([]);
+    return;
+  }
+
+  const invoiceIds = requests.map((request) => request.id);
+  const placeholders = invoiceIds.map(() => '?').join(', ');
+  const items = db.prepare(`SELECT * FROM invoice_items WHERE invoice_id IN (${placeholders})`).all(...invoiceIds) as any[];
+  const payments = db.prepare(`
+    SELECT p.*, u.full_name AS recorded_by_name
+    FROM payments p
+    LEFT JOIN users u ON u.id = p.recorded_by
+    WHERE p.invoice_id IN (${placeholders})
+    ORDER BY p.payment_date DESC, p.created_at DESC
+  `).all(...invoiceIds) as any[];
+  const itemsByInvoice = new Map<string, any[]>();
+
+  for (const item of items) {
+    const invoiceItems = itemsByInvoice.get(item.invoice_id) || [];
+    invoiceItems.push(item);
+    itemsByInvoice.set(item.invoice_id, invoiceItems);
+  }
+  const enrichedPayments = enrichPayments(payments);
+  const enrichedPaymentsByInvoice = new Map<string, any[]>();
+  for (const payment of enrichedPayments) {
+    const invoicePayments = enrichedPaymentsByInvoice.get(payment.invoice_id) || [];
+    invoicePayments.push(payment);
+    enrichedPaymentsByInvoice.set(payment.invoice_id, invoicePayments);
+  }
+
+  res.json(requests.map((request) => ({
+    ...request,
+    items: itemsByInvoice.get(request.id) || [],
+    payments: enrichedPaymentsByInvoice.get(request.id) || [],
+  })));
+});
+
+apiRouter.get('/planner/accommodation-stays', requireAuth, requireRole(plannerAccommodationRoles), (_req: Request, res: Response): void => {
+  const stays = db.prepare(`
+    SELECT ii.id, ii.description, ii.check_in_date, ii.check_out_date,
+           s.id AS student_id, s.first_name, s.last_name, inv.invoice_number
+    FROM invoice_items ii
+    JOIN invoices inv ON inv.id = ii.invoice_id
+    JOIN students s ON s.id = inv.student_id
+    WHERE ii.category = 'accommodation'
+      AND ii.check_in_date IS NOT NULL
+      AND ii.check_out_date IS NOT NULL
+      AND inv.status != 'cancelled'
+    ORDER BY ii.check_in_date, ii.check_out_date, ii.id
+    LIMIT 500
+  `).all();
+  res.json(stays);
+});
+
+apiRouter.post('/customer-requests', requireAuth, requireRole(customerRequestRoles), (req: Request, res: Response): void => {
+  const {
+    student_id,
+    currency,
+    due_date,
+    special_request,
+    items,
+    initial_payment,
+  } = req.body || {};
+
+  if (typeof student_id !== 'string' || !student_id.trim()) {
+    res.status(400).json({ error: 'Select a customer' });
+    return;
+  }
+  if (!billingCurrencies.has(currency)) {
+    res.status(400).json({ error: 'Currency must be EUR, EGP, USD, or GBP' });
+    return;
+  }
+  if (!isValidDate(due_date)) {
+    res.status(400).json({ error: 'A valid payment due date is required' });
+    return;
+  }
+  if (typeof special_request !== 'undefined' && (typeof special_request !== 'string' || special_request.length > 2000)) {
+    res.status(400).json({ error: 'Special request must be 2000 characters or fewer' });
+    return;
+  }
+  if (!Array.isArray(items) || items.length === 0 || items.length > 30) {
+    res.status(400).json({ error: 'Add between 1 and 30 request items' });
+    return;
+  }
+  if (!initial_payment || typeof initial_payment !== 'object') {
+    res.status(400).json({ error: 'A deposit is required to record a customer request' });
+    return;
+  }
+  if (!isValidCashMethod(initial_payment.payment_method, currency) ||
+      !isValidDate(initial_payment.payment_date) ||
+      !isValidFinanceAccount(initial_payment.payment_account)) {
+    res.status(400).json({ error: 'Choose a valid payment method, account, and date' });
+    return;
+  }
+  if (
+    (typeof initial_payment.reference_number !== 'undefined' && typeof initial_payment.reference_number !== 'string') ||
+    (typeof initial_payment.notes !== 'undefined' && typeof initial_payment.notes !== 'string')
+  ) {
+    res.status(400).json({ error: 'Payment reference and notes must be text' });
+    return;
+  }
+  if ((initial_payment.reference_number || '').length > 100) {
+    res.status(400).json({ error: 'Payment reference must be 100 characters or fewer' });
+    return;
+  }
+  if ((initial_payment.notes || '').length > 500) {
+    res.status(400).json({ error: 'Payment notes must be 500 characters or fewer' });
+    return;
+  }
+
+  const student = db.prepare('SELECT id FROM students WHERE id = ?').get(student_id) as { id: string } | undefined;
+  if (!student) {
+    res.status(404).json({ error: 'Customer not found' });
+    return;
+  }
+
+  const normalizedItems: Array<{
+    category: string;
+    description: string;
+    quantity: number;
+    unitPrice: number;
+    total: number;
+    equipmentId?: string;
+    expectedReturn?: string;
+    conditionOut?: string;
+    checkInDate?: string;
+    checkOutDate?: string;
+  }> = [];
+  let totalCents = 0;
+  for (const item of items) {
+    let description = typeof item?.description === 'string' ? item.description.trim() : '';
+    const category = item?.category;
+    let quantity = Number(item?.quantity);
+    const unitPrice = Number(item?.unit_price);
+    if (category === 'accommodation' && isValidDate(item?.check_in_date) && isValidDate(item?.check_out_date) && item.check_out_date > item.check_in_date) {
+      quantity = getAccommodationNights(item.check_in_date, item.check_out_date);
+    }
+    if (
+      !customerRequestCategories.has(category) ||
+      !description ||
+      description.length > 200 ||
+      !Number.isInteger(quantity) ||
+      quantity < 1 ||
+      quantity > 1000 ||
+      !Number.isFinite(unitPrice) ||
+      unitPrice <= 0 ||
+      unitPrice > 10_000_000
+    ) {
+      res.status(400).json({ error: 'Each item needs a valid category, description, quantity, and unit price' });
+      return;
+    }
+
+    let checkInDate: string | undefined;
+    let checkOutDate: string | undefined;
+    if (category === 'accommodation') {
+      if (!isValidDate(item.check_in_date) || !isValidDate(item.check_out_date) || item.check_out_date <= item.check_in_date) {
+        res.status(400).json({ error: 'Accommodation items require valid check-in and check-out dates, with check-out after check-in' });
+        return;
+      }
+      checkInDate = item.check_in_date;
+      checkOutDate = item.check_out_date;
+      quantity = getAccommodationNights(item.check_in_date, item.check_out_date);
+    } else if (item.check_in_date !== undefined || item.check_out_date !== undefined) {
+      res.status(400).json({ error: 'Check-in and check-out dates are only valid for accommodation items' });
+      return;
+    }
+
+    let equipmentId: string | undefined;
+    let expectedReturn: string | undefined;
+    let conditionOut: string | undefined;
+    if (item?.equipment_id !== undefined) {
+      if (
+        typeof item.equipment_id !== 'string' ||
+        !item.equipment_id.trim() ||
+        (category !== 'shop' && category !== 'gear_rental') ||
+        !isValidDate(item.expected_return) ||
+        item.expected_return < new Date().toISOString().slice(0, 10)
+      ) {
+        res.status(400).json({ error: 'A valid rental item and expected return date are required' });
+        return;
+      }
+
+      const equipment = db.prepare(`
+        SELECT id, item_name, size, condition, quantity_available
+        FROM equipment
+        WHERE id = ?
+      `).get(item.equipment_id) as {
+        id: string;
+        item_name: string;
+        size: string | null;
+        condition: string;
+        quantity_available: number;
+      } | undefined;
+      if (!equipment) {
+        res.status(404).json({ error: 'Rental equipment not found' });
+        return;
+      }
+      if (quantity > equipment.quantity_available) {
+        res.status(409).json({ error: `Only ${equipment.quantity_available} unit(s) of ${equipment.item_name} are available` });
+        return;
+      }
+
+      equipmentId = equipment.id;
+      expectedReturn = item.expected_return;
+      conditionOut = equipment.condition;
+      description = `Gear rental — ${equipment.item_name}${equipment.size ? ` (${equipment.size})` : ''}`;
+    } else if (item?.expected_return !== undefined) {
+      res.status(400).json({ error: 'An expected return date can only be set for a gear rental' });
+      return;
+    }
+
+    const roundedUnitPrice = Math.round(unitPrice * 100) / 100;
+    const lineTotalCents = Math.round(roundedUnitPrice * quantity * 100);
+    totalCents += lineTotalCents;
+    normalizedItems.push({
+      category,
+      description,
+      quantity,
+      unitPrice: roundedUnitPrice,
+      total: lineTotalCents / 100,
+      equipmentId,
+      expectedReturn,
+      conditionOut,
+      checkInDate,
+      checkOutDate,
+    });
+  }
+
+  const rentalQuantities = new Map<string, number>();
+  for (const item of normalizedItems) {
+    if (item.equipmentId) {
+      rentalQuantities.set(item.equipmentId, (rentalQuantities.get(item.equipmentId) || 0) + item.quantity);
+    }
+  }
+  for (const [equipmentId, quantity] of rentalQuantities) {
+    const equipment = db.prepare('SELECT item_name, quantity_available FROM equipment WHERE id = ?').get(equipmentId) as {
+      item_name: string;
+      quantity_available: number;
+    };
+    if (quantity > equipment.quantity_available) {
+      res.status(409).json({ error: `Only ${equipment.quantity_available} unit(s) of ${equipment.item_name} are available` });
+      return;
+    }
+  }
+
+  const depositCents = Math.round(Number(initial_payment.amount) * 100);
+  if (!Number.isFinite(depositCents) || depositCents <= 0 || depositCents > totalCents) {
+    res.status(400).json({ error: 'Deposit must be greater than zero and no more than the request total' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const invoiceId = `inv_${crypto.randomUUID()}`;
+  const allocationItems = normalizedItems.map((item, index) => ({
+    id: `item_${invoiceId}_${index}`,
+    description: item.description,
+    category: item.category,
+    capacityCents: Math.round(item.total * 100),
+    usedCents: 0,
+  }));
+  const initialAllocations = normalizePaymentAllocations(
+    initial_payment.allocations,
+    allocationItems,
+    depositCents,
+    student_id,
+  );
+  if (typeof initialAllocations === 'string') {
+    res.status(400).json({ error: initialAllocations });
+    return;
+  }
+  const invoiceNumber = `INV-${now.slice(0, 4)}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+  const requestId = `req_${crypto.randomUUID()}`;
+  const requestNumber = `CR-${now.slice(0, 4)}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+  const paymentId = `pmt_${crypto.randomUUID()}`;
+  const totalAmount = totalCents / 100;
+  const depositAmount = depositCents / 100;
+  const invoiceStatus = depositCents === totalCents ? 'paid' : 'partially_paid';
+  const issueDate = now.slice(0, 10);
+
+  const createRequest = db.transaction(() => {
+    db.prepare(`
+      INSERT INTO invoices (
+        id, invoice_number, student_id, issue_date, due_date, currency,
+        subtotal, tax_rate, tax_amount, total_amount, paid_amount, status,
+        notes, created_by, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      invoiceId,
+      invoiceNumber,
+      student_id,
+      issueDate,
+      due_date,
+      currency,
+      totalAmount,
+      totalAmount,
+      depositAmount,
+      invoiceStatus,
+      special_request?.trim() || null,
+      req.user!.id,
+      now,
+      now,
+    );
+
+    db.prepare(`
+      INSERT INTO customer_requests (
+        id, request_number, invoice_id, special_request, created_by, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(requestId, requestNumber, invoiceId, special_request?.trim() || null, req.user!.id, now, now);
+
+    const insertItem = db.prepare(`
+      INSERT INTO invoice_items (
+        id, invoice_id, category, description, quantity, unit_price, total_price, check_in_date, check_out_date
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    normalizedItems.forEach((item, index) => {
+      insertItem.run(
+        `item_${invoiceId}_${index}`,
+        invoiceId,
+        item.category,
+        item.description,
+        item.quantity,
+        item.unitPrice,
+        item.total,
+        item.checkInDate || null,
+        item.checkOutDate || null,
+      );
+    });
+
+    for (const item of normalizedItems) {
+      if (!item.equipmentId) continue;
+
+      const reserved = db.prepare(`
+        UPDATE equipment
+        SET quantity_available = quantity_available - ?, updated_at = ?
+        WHERE id = ? AND quantity_available >= ?
+      `).run(item.quantity, now, item.equipmentId, item.quantity);
+      if (reserved.changes !== 1) {
+        const conflict = new Error('RENTAL_STOCK_CONFLICT');
+        conflict.name = 'RentalStockConflict';
+        throw conflict;
+      }
+
+      const insertCheckout = db.prepare(`
+        INSERT INTO equipment_checkouts (
+          id, equipment_id, student_id, instructor_id, checkout_time, expected_return,
+          condition_out, notes, created_at
+        ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)
+      `);
+      for (let unit = 0; unit < item.quantity; unit += 1) {
+        insertCheckout.run(
+          `chk_${crypto.randomUUID()}`,
+          item.equipmentId,
+          student_id,
+          now,
+          item.expectedReturn,
+          item.conditionOut || 'good',
+          `Rental billed on ${requestNumber}`,
+          now,
+        );
+      }
+    }
+
+    db.prepare(`
+      INSERT INTO payments (
+        id, invoice_id, amount, currency, payment_method, payment_account, payment_date,
+        reference_number, notes, recorded_by, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      paymentId,
+      invoiceId,
+      depositAmount,
+      currency,
+      initial_payment.payment_method,
+      initial_payment.payment_account.trim(),
+      initial_payment.payment_date,
+      initial_payment.reference_number?.trim() || null,
+      initial_payment.notes?.trim() || null,
+      req.user!.id,
+      now,
+    );
+    insertPaymentAllocations(paymentId, initialAllocations, now);
+  });
+
+  try {
+    createRequest();
+  } catch (error) {
+    if (error instanceof Error && error.name === 'RentalStockConflict') {
+      res.status(409).json({ error: 'Rental inventory changed while saving. Review availability and try again.' });
+      return;
+    }
+    throw error;
+  }
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'CREATE_CUSTOMER_REQUEST',
+    entityType: 'CUSTOMER_REQUEST',
+    entityId: requestId,
+    details: { requestNumber, invoiceId, student_id, totalAmount, depositAmount, currency },
+    ip: req.ip,
+  });
+
+  res.status(201).json({
+    id: requestId,
+    requestNumber,
+    invoiceId,
+    invoiceNumber,
+    rentalUnits: normalizedItems.reduce((sum, item) => sum + (item.equipmentId ? item.quantity : 0), 0),
+    message: 'Customer request recorded',
+  });
+});
+
+apiRouter.post('/customer-requests/:id/payments', requireAuth, requireRole(customerRequestRoles), (req: Request, res: Response): void => {
+  const requestId = req.params.id;
+  const { amount, currency, payment_method, payment_account, payment_date, reference_number, notes, allocations } = req.body || {};
+  const request = db.prepare(`
+    SELECT cr.id, cr.request_number, inv.id AS invoice_id, inv.student_id, inv.currency,
+           inv.total_amount, inv.paid_amount, inv.status
+    FROM customer_requests cr
+    JOIN invoices inv ON cr.invoice_id = inv.id
+    WHERE cr.id = ?
+  `).get(requestId) as any;
+
+  if (!request) {
+    res.status(404).json({ error: 'Customer request not found' });
+    return;
+  }
+  const paymentCurrency = (currency || request.currency) as FinanceCurrency;
+  if (!billingCurrencies.has(paymentCurrency) ||
+      !billingCurrencies.has(request.currency) ||
+      !isValidCashMethod(payment_method, paymentCurrency) ||
+      !isValidFinanceAccount(payment_account) ||
+      !isValidDate(payment_date)) {
+    res.status(400).json({ error: 'Choose a valid payment method, account, and date' });
+    return;
+  }
+  if (
+    (typeof reference_number !== 'undefined' && typeof reference_number !== 'string') ||
+    (typeof notes !== 'undefined' && typeof notes !== 'string')
+  ) {
+    res.status(400).json({ error: 'Payment reference and notes must be text' });
+    return;
+  }
+  if ((reference_number || '').length > 100) {
+    res.status(400).json({ error: 'Payment reference must be 100 characters or fewer' });
+    return;
+  }
+  if ((notes || '').length > 500) {
+    res.status(400).json({ error: 'Payment notes must be 500 characters or fewer' });
+    return;
+  }
+
+  const paymentCents = Math.round(Number(amount) * 100);
+  const balanceCents = Math.round((request.total_amount - request.paid_amount) * 100);
+  if (!Number.isFinite(paymentCents) || paymentCents <= 0 ||
+      Math.abs(Number(amount) * 100 - paymentCents) > 0.00001) {
+    res.status(400).json({ error: 'Payment must be greater than zero and recorded to two decimal places' });
+    return;
+  }
+  const fxRates = getFinanceFxRates();
+  if (!fxRates) {
+    res.status(503).json({ error: 'Saved EUR conversion rates are invalid and need correction' });
+    return;
+  }
+  const conversion = getPaymentCurrencyAmounts(paymentCents, paymentCurrency, request.currency as FinanceCurrency, fxRates.rates_to_eur);
+  if (typeof conversion === 'string') {
+    res.status(409).json({ error: conversion });
+    return;
+  }
+  if (conversion.invoiceAmountCents > balanceCents) {
+    res.status(400).json({ error: 'Converted payment must be no more than the outstanding bill balance' });
+    return;
+  }
+
+  const items = getInvoicePaymentItems(request.invoice_id);
+  const normalizedAllocations = typeof allocations === 'undefined'
+    ? autoAllocatePayment(items, conversion.invoiceAmountCents, request.student_id)
+    : normalizePaymentAllocations(allocations, items, conversion.invoiceAmountCents, request.student_id);
+  if (typeof normalizedAllocations === 'string') {
+    res.status(400).json({ error: normalizedAllocations });
+    return;
+  }
+
+  const paymentId = `pmt_${crypto.randomUUID()}`;
+  const now = new Date().toISOString();
+  const newPaidAmount = (Math.round(request.paid_amount * 100) + conversion.invoiceAmountCents) / 100;
+  const newStatus = newPaidAmount >= request.total_amount ? 'paid' : 'partially_paid';
+  const recordPayment = db.transaction(() => {
+    db.prepare(`
+      INSERT INTO payments (
+        id, invoice_id, amount, currency, payment_method, payment_account, payment_date,
+        reference_number, notes, invoice_amount_cents, eur_amount_cents, exchange_rate_to_eur,
+        recorded_by, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      paymentId,
+      request.invoice_id,
+      paymentCents / 100,
+      paymentCurrency,
+      payment_method,
+      payment_account.trim(),
+      payment_date,
+      reference_number?.trim() || null,
+      notes?.trim() || null,
+      conversion.invoiceAmountCents,
+      conversion.eurAmountCents,
+      conversion.rateToEur,
+      req.user!.id,
+      now,
+    );
+    insertPaymentAllocations(paymentId, normalizedAllocations, now);
+    db.prepare('UPDATE invoices SET paid_amount = ?, status = ?, updated_at = ? WHERE id = ?')
+      .run(newPaidAmount, newStatus, now, request.invoice_id);
+    db.prepare('UPDATE customer_requests SET updated_at = ? WHERE id = ?').run(now, requestId);
+  });
+
+  recordPayment();
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'RECORD_CUSTOMER_REQUEST_PAYMENT',
+    entityType: 'PAYMENT',
+    entityId: paymentId,
+    details: {
+      requestId,
+      requestNumber: request.request_number,
+      amount: paymentCents / 100,
+      currency: paymentCurrency,
+      invoiceAmount: conversion.invoiceAmountCents / 100,
+      eurAmount: conversion.eurAmountCents === null ? null : conversion.eurAmountCents / 100,
+      payment_account,
+      newPaidAmount,
+      newStatus,
+    },
+    ip: req.ip,
+  });
+
+  res.status(201).json({ paymentId, newPaidAmount, status: newStatus, message: 'Payment recorded in customer bill and income ledger' });
+});
+
+apiRouter.get('/finance/invoices', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const invoices = db.prepare(`
+    SELECT inv.*, s.first_name, s.last_name, s.email as student_email,
+           s.phone as student_phone,
+           cr.request_number AS customer_request_number
+    FROM invoices inv
+    JOIN students s ON inv.student_id = s.id
+    LEFT JOIN customer_requests cr ON cr.invoice_id = inv.id
+    ORDER BY inv.issue_date DESC
+  `).all() as any[];
+
+  const getItems = db.prepare('SELECT * FROM invoice_items WHERE invoice_id = ?');
+  const getPayments = db.prepare(`
+    SELECT p.*, u.full_name AS recorded_by_name
+    FROM payments p
+    LEFT JOIN users u ON u.id = p.recorded_by
+    WHERE p.invoice_id = ?
+    ORDER BY p.payment_date DESC, p.created_at DESC
+  `);
+
+  const enriched = invoices.map((inv) => {
+    const allocationItems = new Map(getInvoicePaymentItems(inv.id).map((item) => [item.id, item]));
+    return {
+      ...inv,
+      items: (getItems.all(inv.id) as any[]).map((item) => {
+        const allocationItem = allocationItems.get(item.id);
+        const capacityCents = allocationItem?.capacityCents || 0;
+        const paidCents = Math.max(0, Math.min(capacityCents, allocationItem?.usedCents || 0));
+        return {
+          ...item,
+          paid_amount: paidCents / 100,
+          remaining_amount: (capacityCents - paidCents) / 100,
+        };
+      }),
+      payments: enrichPayments(getPayments.all(inv.id) as any[]),
+    };
+  });
+
+  res.json(enriched);
+});
+
+// Create a customer (or reuse a registered contact) and add an invoice from the Customers workspace.
+apiRouter.post('/customers/with-invoice', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const { customer, invoice } = req.body || {};
+  const submittedItems = Array.isArray(invoice?.items) ? invoice.items : invoice?.item ? [invoice.item] : [];
+  const items = submittedItems.map((item: any) => {
+    if (item?.category !== 'accommodation' || !isValidDate(item.check_in_date) || !isValidDate(item.check_out_date) || item.check_out_date <= item.check_in_date) return item;
+    return { ...item, quantity: getAccommodationNights(item.check_in_date, item.check_out_date) };
+  });
+  const existingStudentId = typeof customer?.student_id === 'string' ? customer.student_id : '';
+  const firstName = typeof customer?.first_name === 'string' ? customer.first_name.trim() : '';
+  const lastName = typeof customer?.last_name === 'string' ? customer.last_name.trim() : '';
+  const email = typeof customer?.email === 'string' ? customer.email.trim().toLowerCase() : '';
+  const selectedStudent = existingStudentId ? db.prepare('SELECT id, email FROM students WHERE id = ?').get(existingStudentId) as { id: string; email: string } | undefined : undefined;
+  const existingStudent = selectedStudent || db.prepare('SELECT id, email FROM students WHERE email = ?').get(email) as { id: string; email: string } | undefined;
+  const currency = invoice?.currency;
+  const taxRate = Number(invoice?.tax_rate ?? 0);
+  const hasInvalidItem = items.length === 0 || items.some((item: any) => {
+    const unitPrice = Number(item?.unit_price);
+    const quantity = Number(item?.quantity ?? 1);
+    return !item || typeof item.description !== 'string' || !item.description.trim() || item.description.trim().length > 200 ||
+      !customerRequestCategories.has(item.category) || !Number.isFinite(unitPrice) || unitPrice < 0 || unitPrice > 10_000_000 ||
+      !Number.isFinite(quantity) || quantity <= 0 || quantity > 1000 ||
+      (item.service_start_date && !isValidDate(item.service_start_date)) ||
+      (item.category === 'accommodation' && (!isValidDate(item.check_in_date) || !isValidDate(item.check_out_date) || item.check_out_date <= item.check_in_date));
+  });
+  const issueDate = invoice?.issue_date;
+  const dueDate = invoice?.due_date;
+  if (!firstName || !lastName || !email || !/^\S+@\S+\.\S+$/.test(email) || email.length > 254 ||
+    (existingStudentId && !selectedStudent) || (selectedStudent && selectedStudent.email.trim().toLowerCase() !== email)) {
+    res.status(400).json({ error: 'Enter the customer’s first name, last name, and a valid email.' }); return;
+  }
+  if (hasInvalidItem) {
+    res.status(400).json({ error: 'Choose a billable item and enter a valid quantity and price.' }); return;
+  }
+  if (!billingCurrencies.has(currency) || !isValidDate(issueDate) || !isValidDate(dueDate) || dueDate < issueDate) {
+    res.status(400).json({ error: 'Choose a supported invoice currency and valid invoice and due dates.' }); return;
+  }
+  if (!Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100) {
+    res.status(400).json({ error: 'Tax rate must be between 0 and 100%.' }); return;
+  }
+  if (customer?.course_start_date && !isValidDate(customer.course_start_date)) {
+    res.status(400).json({ error: 'Course start date must be a valid date.' }); return;
+  }
+  const stayError = validateStayDetails({
+    whatsapp: customer.whatsapp,
+    arrival_date: customer.arrival_date,
+    departure_date: customer.departure_date,
+    needs_accommodation: customer.needs_accommodation,
+    needs_airport_transfer: customer.needs_airport_transfer,
+    flight_number: customer.flight_number,
+    airline_name: customer.airline_name,
+    flight_arrival_at: customer.flight_arrival_at,
+    transportation_requirements: customer.transportation_requirements,
+    hotel_name: customer.hotel_name,
+    assigned_driver: customer.assigned_driver,
+    notes: customer.notes,
+  });
+  if (stayError) { res.status(400).json({ error: stayError }); return; }
+  const studentId = existingStudent?.id || ('std_' + crypto.randomUUID().slice(0, 10));
+  const invoiceId = 'inv_' + crypto.randomUUID().slice(0, 10);
+  const now = new Date().toISOString();
+  const subtotal = Math.round(items.reduce((sum: number, item: any) => sum + Number(item.quantity ?? 1) * Number(item.unit_price), 0) * 100) / 100;
+  const taxAmount = Math.round(subtotal * taxRate) / 100;
+  const totalAmount = subtotal + taxAmount;
+  const comment = typeof customer.notes === 'string' ? customer.notes.trim().slice(0, 500) : '';
+  const create = db.transaction(() => {
+    if (existingStudent) {
+      db.prepare(`UPDATE students SET phone = COALESCE(?, phone), whatsapp = COALESCE(?, whatsapp), arrival_date = COALESCE(?, arrival_date), departure_date = COALESCE(?, departure_date),
+        needs_accommodation = COALESCE(?, needs_accommodation), needs_airport_transfer = COALESCE(?, needs_airport_transfer),
+        whatsapp_status = COALESCE(?, whatsapp_status), transfer_status = COALESCE(?, transfer_status), flight_number = COALESCE(?, flight_number), airline_name = COALESCE(?, airline_name),
+        flight_arrival_at = COALESCE(?, flight_arrival_at), transportation_requirements = COALESCE(?, transportation_requirements), hotel_name = COALESCE(?, hotel_name),
+        assigned_driver = COALESCE(?, assigned_driver), notes = COALESCE(?, notes), updated_at = ? WHERE id = ?`)
+        .run(optionalText(customer.phone), optionalText(customer.whatsapp), customer.arrival_date || null, customer.departure_date || null,
+          customer.needs_accommodation == null ? null : customer.needs_accommodation ? 1 : 0,
+          customer.needs_airport_transfer == null ? null : customer.needs_airport_transfer ? 1 : 0,
+          optionalText(customer.whatsapp_status), optionalText(customer.transfer_status),
+          optionalText(customer.flight_number), optionalText(customer.airline_name), customer.flight_arrival_at || null,
+          optionalText(customer.transportation_requirements), optionalText(customer.hotel_name), optionalText(customer.assigned_driver), comment || null, now, studentId);
+    } else db.prepare(`INSERT INTO students (id, first_name, last_name, email, phone, whatsapp, arrival_date, departure_date,
+      needs_accommodation, needs_airport_transfer, whatsapp_status, transfer_status, flight_number, airline_name, flight_arrival_at,
+      transportation_requirements, hotel_name, assigned_driver, status, notes, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`)
+      .run(studentId, firstName, lastName, email, customer.phone || null, optionalText(customer.whatsapp),
+        customer.arrival_date || null, customer.departure_date || null, customer.needs_accommodation ? 1 : 0,
+        customer.needs_airport_transfer ? 1 : 0, optionalText(customer.whatsapp_status), optionalText(customer.transfer_status),
+        optionalText(customer.flight_number), optionalText(customer.airline_name),
+        customer.flight_arrival_at || null, optionalText(customer.transportation_requirements), optionalText(customer.hotel_name),
+        optionalText(customer.assigned_driver), comment || null, now, now);
+    db.prepare(`INSERT INTO invoices (id, invoice_number, student_id, issue_date, due_date, currency, subtotal,
+      tax_rate, tax_amount, total_amount, paid_amount, status, notes, created_by, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'issued', ?, ?, ?, ?)`)
+      .run(invoiceId, `INV-${issueDate.slice(0, 4)}-${crypto.randomUUID().slice(0, 4).toUpperCase()}`,
+        studentId, issueDate, dueDate, currency, subtotal, taxRate, taxAmount, totalAmount, comment || null, req.user!.id, now, now);
+    const insertItem = db.prepare(`INSERT INTO invoice_items (id, invoice_id, category, description, quantity, unit_price, total_price, check_in_date, check_out_date, service_start_date)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    items.forEach((item: any, index: number) => {
+      const quantity = Number(item.quantity ?? 1);
+      const unitPrice = Number(item.unit_price);
+      insertItem.run(`item_${invoiceId}_${index}`, invoiceId, item.category, item.description.trim(), quantity, unitPrice,
+        Math.round(quantity * unitPrice * 100) / 100,
+        item.category === 'accommodation' ? item.check_in_date : null,
+        item.category === 'accommodation' ? item.check_out_date : null,
+        item.service_start_date || (index === 0 ? customer.course_start_date || null : null));
+    });
+  });
+  try { create(); } catch (error: any) {
+    if (String(error?.message || '').includes('UNIQUE')) { res.status(409).json({ error: 'A record with this identifier already exists. Please try again.' }); return; }
+    throw error;
+  }
+  if (!existingStudent) logAudit({ userId: req.user!.id, userEmail: req.user!.email, userRole: req.user!.role,
+    action: 'CREATE_STUDENT', entityType: 'STUDENT', entityId: studentId,
+    details: { name: `${firstName} ${lastName}`, email, invoiceId }, ip: req.ip });
+  logAudit({ userId: req.user!.id, userEmail: req.user!.email, userRole: req.user!.role,
+    action: 'CREATE_INVOICE', entityType: 'INVOICE', entityId: invoiceId,
+    details: { student_id: studentId, totalAmount: subtotal, currency, source: 'customers' }, ip: req.ip });
+  res.status(201).json({ studentId, invoiceId, totalAmount: subtotal, currency, message: 'Customer and invoice created.' });
+});
+
+apiRouter.patch('/finance/invoices/:id', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const { issue_date, due_date, tax_rate, notes, items } = req.body || {};
+  const invoice = db.prepare('SELECT id, paid_amount, currency, status FROM invoices WHERE id = ?').get(id) as {
+    id: string;
+    paid_amount: number;
+    currency: string;
+    status: string;
+  } | undefined;
+
+  if (!invoice) {
+    res.status(404).json({ error: 'Invoice not found' });
+    return;
+  }
+  if (invoice.status === 'cancelled') {
+    res.status(409).json({ error: 'Cancelled invoices cannot be edited' });
+    return;
+  }
+  if (!isValidDate(issue_date) || !isValidDate(due_date) || due_date < issue_date) {
+    res.status(400).json({ error: 'Enter valid invoice and due dates; the due date cannot be before the invoice date' });
+    return;
+  }
+  if (typeof tax_rate !== 'number' || !Number.isFinite(tax_rate) || tax_rate < 0 || tax_rate > 100) {
+    res.status(400).json({ error: 'Tax rate must be between 0 and 100%' });
+    return;
+  }
+  if (typeof notes !== 'string' || notes.length > 2000) {
+    res.status(400).json({ error: 'Invoice notes must be 2000 characters or fewer' });
+    return;
+  }
+  if (!Array.isArray(items) || items.length === 0 || items.length > 30) {
+    res.status(400).json({ error: 'An invoice must contain between 1 and 30 service items' });
+    return;
+  }
+
+  const normalizedItems: Array<{
+    category: string;
+    description: string;
+    quantity: number;
+    unitPrice: number;
+    totalCents: number;
+    checkInDate?: string;
+    checkOutDate?: string;
+    serviceStartDate?: string;
+  }> = [];
+  let subtotalCents = 0;
+  for (const item of items) {
+    const category = item?.category;
+    const description = typeof item?.description === 'string' ? item.description.trim() : '';
+    let quantity = Number(item?.quantity);
+    const unitPrice = Number(item?.unit_price);
+    if (item?.service_start_date && !isValidDate(item.service_start_date)) {
+      res.status(400).json({ error: 'Event start date must be a valid date' });
+      return;
+    }
+    if (category === 'accommodation' && isValidDate(item?.check_in_date) && isValidDate(item?.check_out_date) && item.check_out_date > item.check_in_date) {
+      quantity = getAccommodationNights(item.check_in_date, item.check_out_date);
+    }
+    if (
+      !customerRequestCategories.has(category) ||
+      !description ||
+      description.length > 200 ||
+      !Number.isFinite(quantity) ||
+      quantity <= 0 ||
+      quantity > 1000 ||
+      !Number.isFinite(unitPrice) ||
+      unitPrice <= 0 ||
+      unitPrice > 10_000_000
+    ) {
+      res.status(400).json({ error: 'Each service needs a valid category, description, quantity, and unit price' });
+      return;
+    }
+
+    let checkInDate: string | undefined;
+    let checkOutDate: string | undefined;
+    if (category === 'accommodation') {
+      if (!isValidDate(item.check_in_date) || !isValidDate(item.check_out_date) || item.check_out_date <= item.check_in_date) {
+        res.status(400).json({ error: 'Accommodation items require valid check-in and check-out dates, with check-out after check-in' });
+        return;
+      }
+      checkInDate = item.check_in_date;
+      checkOutDate = item.check_out_date;
+      quantity = getAccommodationNights(item.check_in_date, item.check_out_date);
+    } else if (item.check_in_date !== undefined || item.check_out_date !== undefined) {
+      res.status(400).json({ error: 'Check-in and check-out dates are only valid for accommodation items' });
+      return;
+    }
+
+    const roundedUnitPrice = Math.round(unitPrice * 100) / 100;
+    const totalCents = Math.round(quantity * roundedUnitPrice * 100);
+    subtotalCents += totalCents;
+    normalizedItems.push({ category, description, quantity, unitPrice: roundedUnitPrice, totalCents, checkInDate, checkOutDate, serviceStartDate: item.service_start_date || undefined });
+  }
+
+  const taxCents = Math.round(subtotalCents * tax_rate / 100);
+  const totalCents = subtotalCents + taxCents;
+  const paidCents = Math.round(invoice.paid_amount * 100);
+  if (totalCents <= 0 || totalCents < paidCents) {
+    res.status(409).json({ error: 'Invoice total cannot be less than payments already recorded' });
+    return;
+  }
+
+  const subtotal = subtotalCents / 100;
+  const taxAmount = taxCents / 100;
+  const totalAmount = totalCents / 100;
+  const paidAmount = paidCents / 100;
+  const status = paidCents === totalCents ? 'paid' : paidCents > 0 ? 'partially_paid' : 'issued';
+  const now = new Date().toISOString();
+  const updateInvoice = db.transaction(() => {
+    db.prepare(`
+      UPDATE invoices
+      SET issue_date = ?, due_date = ?, subtotal = ?, tax_rate = ?, tax_amount = ?,
+          total_amount = ?, status = ?, notes = ?, updated_at = ?
+      WHERE id = ?
+    `).run(issue_date, due_date, subtotal, tax_rate, taxAmount, totalAmount, status, notes.trim() || null, now, id);
+
+    db.prepare('DELETE FROM invoice_items WHERE invoice_id = ?').run(id);
+    const insertItem = db.prepare(`
+      INSERT INTO invoice_items (
+        id, invoice_id, category, description, quantity, unit_price, total_price, check_in_date, check_out_date, service_start_date
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    normalizedItems.forEach((item, index) => {
+      insertItem.run(
+        `item_${id}_${index}_${crypto.randomUUID().slice(0, 8)}`,
+        id,
+        item.category,
+        item.description,
+        item.quantity,
+        item.unitPrice,
+        item.totalCents / 100,
+        item.checkInDate || null,
+        item.checkOutDate || null,
+        item.serviceStartDate || null,
+      );
+    });
+    db.prepare('UPDATE customer_requests SET special_request = ?, updated_at = ? WHERE invoice_id = ?')
+      .run(notes.trim() || null, now, id);
+    if (invoice.status !== status) {
+      db.prepare('UPDATE bookings SET payment_status = ? WHERE id IN (SELECT booking_id FROM invoices WHERE id = ?) AND booking_id IS NOT NULL')
+        .run(status, id);
+    }
+  });
+  updateInvoice();
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'UPDATE_INVOICE',
+    entityType: 'INVOICE',
+    entityId: id,
+    details: { subtotal, tax_rate, taxAmount, totalAmount, paidAmount, status },
+    ip: req.ip,
+  });
+
+  res.json({ message: 'Invoice updated successfully', subtotal, tax_amount: taxAmount, total_amount: totalAmount, paid_amount: paidAmount, status });
+});
+
+apiRouter.post('/finance/invoices', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const { student_id, booking_id, issue_date, due_date, currency, tax_rate, items, notes } = req.body;
+  if (!student_id || !items || !Array.isArray(items) || items.length === 0) {
+    res.status(400).json({ error: 'Student and at least one line item are required' });
+    return;
+  }
+  if (!billingCurrencies.has(currency || 'EUR')) {
+    res.status(400).json({ error: 'Currency must be EUR, EGP, USD, or GBP' });
+    return;
+  }
+  if (typeof tax_rate !== 'undefined' && (!Number.isFinite(Number(tax_rate)) || Number(tax_rate) < 0 || Number(tax_rate) > 100)) {
+    res.status(400).json({ error: 'Tax rate must be between 0 and 100%' });
+    return;
+  }
+  if (items.some((item: any) =>
+    !item ||
+    (item.category !== undefined && !customerRequestCategories.has(item.category)) ||
+    typeof item.description !== 'string' ||
+    !item.description.trim() ||
+    item.description.trim().length > 200 ||
+    !Number.isFinite(Number(item.quantity)) ||
+    Number(item.quantity) <= 0 ||
+    Number(item.quantity) > 1000 ||
+    !Number.isFinite(Number(item.unit_price)) ||
+    Number(item.unit_price) <= 0 ||
+    Number(item.unit_price) > 10_000_000 ||
+    (item.category === 'accommodation' && (
+      !isValidDate(item.check_in_date) ||
+      !isValidDate(item.check_out_date) ||
+      item.check_out_date <= item.check_in_date
+    )) ||
+    (item.category !== 'accommodation' && (item.check_in_date !== undefined || item.check_out_date !== undefined))
+  )) {
+    res.status(400).json({ error: 'Each service needs a valid category, description, quantity, and unit price' });
+    return;
+  }
+
+  const pricedItems = items.map((item: any) => item.category === 'accommodation'
+    ? { ...item, quantity: getAccommodationNights(item.check_in_date, item.check_out_date) }
+    : item);
+
+  let subtotal = 0;
+  for (const it of pricedItems) {
+    subtotal += Number(it.quantity) * Number(it.unit_price);
+  }
+  const taxRate = Number(tax_rate) || 0;
+  const taxAmount = (subtotal * taxRate) / 100;
+  const totalAmount = subtotal + taxAmount;
+
+  const id = 'inv_' + crypto.randomUUID().slice(0, 10);
+  const invoiceNumber = 'INV-' + new Date().getFullYear() + '-' + Math.floor(1000 + Math.random() * 9000);
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO invoices (
+      id, invoice_number, student_id, booking_id, issue_date, due_date,
+      currency, subtotal, tax_rate, tax_amount, total_amount, paid_amount,
+      status, notes, created_by, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'issued', ?, ?, ?, ?)
+  `).run(
+    id,
+    invoiceNumber,
+    student_id,
+    booking_id || null,
+    issue_date || now.slice(0, 10),
+    due_date || now.slice(0, 10),
+    currency || 'EUR',
+    subtotal,
+    taxRate,
+    taxAmount,
+    totalAmount,
+    notes || null,
+    req.user!.id,
+    now,
+    now
+  );
+
+  const insertItem = db.prepare(`
+    INSERT INTO invoice_items (
+      id, invoice_id, category, description, quantity, unit_price, total_price, check_in_date, check_out_date
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  for (let i = 0; i < pricedItems.length; i++) {
+    const item = pricedItems[i];
+    const qty = Number(item.quantity);
+    const unitPrice = Number(item.unit_price);
+    insertItem.run(
+      `item_${id}_${i}`,
+      id,
+      item.category || 'other',
+      item.description.trim(),
+      qty,
+      unitPrice,
+      qty * unitPrice,
+      item.check_in_date || null,
+      item.check_out_date || null,
+    );
+  }
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'CREATE_INVOICE',
+    entityType: 'INVOICE',
+    entityId: id,
+    details: { invoiceNumber, student_id, totalAmount, currency: currency || 'EUR' },
+    ip: req.ip,
+  });
+
+  res.status(201).json({ id, invoiceNumber, message: 'Invoice created successfully' });
+});
+
+apiRouter.post('/finance/invoices/:id/payments', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const { amount, currency, customer_id, payment_account, payment_method, payment_date, reference_number, notes, allocations } = req.body || {};
+
+  const invoice = db.prepare('SELECT * FROM invoices WHERE id = ?').get(id) as any;
+  if (!invoice) {
+    res.status(404).json({ error: 'Invoice not found' });
+    return;
+  }
+
+  if (customer_id !== invoice.student_id) {
+    res.status(400).json({ error: 'Select the customer linked to this invoice' });
+    return;
+  }
+  const paymentCurrency = (currency || invoice.currency) as FinanceCurrency;
+  if (!billingCurrencies.has(paymentCurrency) ||
+      !billingCurrencies.has(invoice.currency) ||
+      !isValidCashMethod(payment_method, paymentCurrency) ||
+      !isValidFinanceAccount(payment_account) ||
+      !isValidDate(payment_date) ||
+      (typeof reference_number !== 'undefined' && typeof reference_number !== 'string') ||
+      (typeof notes !== 'undefined' && typeof notes !== 'string') ||
+      (reference_number || '').length > 100 ||
+      (notes || '').length > 500) {
+    res.status(400).json({ error: 'Enter a valid payment method, account, date, reference, and notes' });
+    return;
+  }
+  const paymentCents = Math.round(Number(amount) * 100);
+  const currentPaidCents = Math.round(Number(invoice.paid_amount) * 100);
+  const totalCents = Math.round(Number(invoice.total_amount) * 100);
+  if (!Number.isFinite(paymentCents) || paymentCents <= 0 ||
+      Math.abs(Number(amount) * 100 - paymentCents) > 0.00001) {
+    res.status(400).json({ error: 'Payment must be greater than zero and recorded to two decimal places' });
+    return;
+  }
+  const fxRates = getFinanceFxRates();
+  if (!fxRates) {
+    res.status(503).json({ error: 'Saved EUR conversion rates are invalid and need correction' });
+    return;
+  }
+  const conversion = getPaymentCurrencyAmounts(
+    paymentCents,
+    paymentCurrency,
+    invoice.currency as FinanceCurrency,
+    fxRates.rates_to_eur,
+  );
+  if (typeof conversion === 'string') {
+    res.status(409).json({ error: conversion });
+    return;
+  }
+  if (conversion.invoiceAmountCents > totalCents - currentPaidCents) {
+    res.status(400).json({ error: 'Converted payment must be no more than the outstanding invoice balance' });
+    return;
+  }
+  const items = getInvoicePaymentItems(id);
+  const normalizedAllocations = typeof allocations === 'undefined'
+    ? autoAllocatePayment(items, conversion.invoiceAmountCents, invoice.student_id)
+    : normalizePaymentAllocations(allocations, items, conversion.invoiceAmountCents, invoice.student_id);
+  if (typeof normalizedAllocations === 'string') {
+    res.status(400).json({ error: normalizedAllocations });
+    return;
+  }
+
+  const paymentId = `pmt_${crypto.randomUUID()}`;
+  const now = new Date().toISOString();
+  const newPaidAmount = (currentPaidCents + conversion.invoiceAmountCents) / 100;
+  const newStatus = newPaidAmount >= invoice.total_amount ? 'paid' : 'partially_paid';
+  const recordPayment = db.transaction(() => {
+    db.prepare(`
+      INSERT INTO payments (
+        id, invoice_id, amount, currency, payment_method, payment_account, payment_date,
+        reference_number, notes, invoice_amount_cents, eur_amount_cents, exchange_rate_to_eur,
+        recorded_by, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      paymentId,
+      id,
+      paymentCents / 100,
+      paymentCurrency,
+      payment_method,
+      payment_account.trim(),
+      payment_date,
+      reference_number?.trim() || null,
+      notes?.trim() || null,
+      conversion.invoiceAmountCents,
+      conversion.eurAmountCents,
+      conversion.rateToEur,
+      req.user!.id,
+      now,
+    );
+    insertPaymentAllocations(paymentId, normalizedAllocations, now);
+    db.prepare('UPDATE invoices SET paid_amount = ?, status = ?, updated_at = ? WHERE id = ?')
+      .run(newPaidAmount, newStatus, now, id);
+    if (invoice.booking_id) {
+      db.prepare('UPDATE bookings SET payment_status = ? WHERE id = ?').run(newStatus, invoice.booking_id);
+    }
+  });
+  recordPayment();
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'RECORD_PAYMENT',
+    entityType: 'PAYMENT',
+    entityId: paymentId,
+    details: {
+      invoiceId: id,
+      amount: paymentCents / 100,
+      currency: paymentCurrency,
+      invoiceAmount: conversion.invoiceAmountCents / 100,
+      eurAmount: conversion.eurAmountCents === null ? null : conversion.eurAmountCents / 100,
+      payment_method,
+      payment_account,
+      newPaidAmount,
+      newStatus,
+    },
+    ip: req.ip,
+  });
+
+  res.status(201).json({ paymentId, newPaidAmount, status: newStatus, message: 'Payment recorded in ledger' });
+});
+
+apiRouter.post('/finance/payments/:id/adjustments', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const paymentId = req.params.id;
+  const { adjustment_type, direction, amount, adjustment_date, payment_method, payment_account, reason, reference_number, allocations } = req.body || {};
+  const payment = db.prepare(`
+    SELECT p.*, inv.id AS invoice_id, inv.student_id, inv.total_amount, inv.booking_id
+    FROM payments p
+    JOIN invoices inv ON inv.id = p.invoice_id
+    WHERE p.id = ?
+  `).get(paymentId) as any;
+  if (!payment) {
+    res.status(404).json({ error: 'Payment not found' });
+    return;
+  }
+  if (!['refund', 'reversal', 'correction'].includes(adjustment_type) ||
+      !['debit', 'credit'].includes(direction) ||
+      (adjustment_type !== 'correction' && direction !== 'debit')) {
+    res.status(400).json({ error: 'Choose a valid refund, reversal, or correction direction' });
+    return;
+  }
+  if (!isValidDate(adjustment_date) ||
+      !isValidCashMethod(payment_method, payment.currency) ||
+      !isValidFinanceAccount(payment_account) ||
+      typeof reason !== 'string' || !reason.trim() || reason.trim().length > 500 ||
+      (typeof reference_number !== 'undefined' && (typeof reference_number !== 'string' || reference_number.length > 100))) {
+    res.status(400).json({ error: 'Adjustment date, payment account, method, and reason are required' });
+    return;
+  }
+  const amountCents = Math.round(Number(amount) * 100);
+  if (!Number.isFinite(amountCents) || amountCents <= 0 ||
+      Math.abs(Number(amount) * 100 - amountCents) > 0.00001) {
+    res.status(400).json({ error: 'Adjustment amount must be a positive amount in cents' });
+    return;
+  }
+
+  if (!Array.isArray(allocations) || allocations.length === 0 || allocations.length > 30) {
+    res.status(400).json({ error: 'Allocate the adjustment to at least one service' });
+    return;
+  }
+  const invoiceItems = getInvoicePaymentItems(payment.invoice_id);
+  const invoiceItemById = new Map(invoiceItems.map((item) => [item.id, item]));
+  const originalAllocations = db.prepare(`
+    SELECT id, invoice_item_id, service_label, service_category, beneficiary_student_id, amount_cents
+    FROM payment_allocations WHERE payment_id = ?
+  `).all(paymentId) as Array<{
+    id: string;
+    invoice_item_id: string | null;
+    service_label: string;
+    service_category: string;
+    beneficiary_student_id: string | null;
+    amount_cents: number;
+  }>;
+  const normalizedAdjustmentAllocations: Array<{
+    paymentAllocationId: string | null;
+    itemId: string | null;
+    serviceLabel: string;
+    serviceCategory: string;
+    beneficiaryStudentId: string | null;
+    amountCents: number;
+  }> = [];
+  const usedAdjustmentAllocationKeys = new Set<string>();
+  const proposedCreditsByItem = new Map<string, number>();
+  let allocatedCents = 0;
+  for (const raw of allocations as Array<Record<string, unknown>>) {
+    const rowCents = Math.round(Number(raw.amount) * 100);
+    if (!Number.isFinite(rowCents) || rowCents <= 0 ||
+        Math.abs(Number(raw.amount) * 100 - rowCents) > 0.00001) {
+      res.status(400).json({ error: 'Each adjustment allocation needs a positive amount in cents' });
+      return;
+    }
+    let originalAllocation: typeof originalAllocations[number] | undefined;
+    let item: PaymentAllocationItem | undefined;
+    if (typeof raw.payment_allocation_id === 'string') {
+      originalAllocation = originalAllocations.find((allocation) => allocation.id === raw.payment_allocation_id);
+      if (!originalAllocation) {
+        res.status(400).json({ error: 'Adjustment allocation does not belong to this payment' });
+        return;
+      }
+      item = originalAllocation.invoice_item_id ? invoiceItemById.get(originalAllocation.invoice_item_id) : undefined;
+      if (direction === 'debit') {
+        const alreadyAdjusted = db.prepare(`
+          SELECT COALESCE(SUM(paa.amount_cents), 0) AS total
+          FROM payment_adjustment_allocations paa
+          JOIN payment_adjustments pa ON pa.id = paa.adjustment_id
+          WHERE paa.payment_allocation_id = ? AND pa.direction = 'debit'
+        `).get(originalAllocation.id) as { total: number };
+        if (rowCents > originalAllocation.amount_cents - alreadyAdjusted.total) {
+          res.status(409).json({ error: `Adjustment exceeds the unadjusted allocation for ${originalAllocation.service_label}` });
+          return;
+        }
+      }
+    } else if (typeof raw.item_id === 'string') {
+      item = invoiceItemById.get(raw.item_id);
+      if (!item) {
+        res.status(400).json({ error: 'Adjustment service does not belong to this invoice' });
+        return;
+      }
+    }
+    const serviceLabel = originalAllocation?.service_label || item?.description;
+    const serviceCategory = originalAllocation?.service_category || item?.category;
+    const beneficiaryStudentId = originalAllocation?.beneficiary_student_id ||
+      (typeof raw.beneficiary_student_id === 'string' ? raw.beneficiary_student_id : payment.student_id);
+    if (!serviceLabel || !serviceCategory || !beneficiaryStudentId ||
+        !db.prepare('SELECT 1 FROM students WHERE id = ?').get(beneficiaryStudentId)) {
+      res.status(400).json({ error: 'Choose a valid beneficiary and service for each adjustment allocation' });
+      return;
+    }
+    const allocationKey = `${originalAllocation?.id || item?.id}:${beneficiaryStudentId || ''}`;
+    if (usedAdjustmentAllocationKeys.has(allocationKey)) {
+      res.status(400).json({ error: 'Combine duplicate service and beneficiary adjustment allocations' });
+      return;
+    }
+    usedAdjustmentAllocationKeys.add(allocationKey);
+    if (direction === 'credit' && item) {
+      proposedCreditsByItem.set(item.id, (proposedCreditsByItem.get(item.id) || 0) + rowCents);
+    }
+    normalizedAdjustmentAllocations.push({
+      paymentAllocationId: originalAllocation?.id || null,
+      itemId: originalAllocation?.invoice_item_id || item?.id || null,
+      serviceLabel,
+      serviceCategory,
+      beneficiaryStudentId,
+      amountCents: rowCents,
+    });
+    allocatedCents += rowCents;
+  }
+  if (allocatedCents !== amountCents) {
+    res.status(400).json({ error: 'Service adjustment allocations must equal the adjustment amount exactly' });
+    return;
+  }
+  if (direction === 'credit') {
+    for (const [itemId, creditCents] of proposedCreditsByItem) {
+      const item = invoiceItemById.get(itemId)!;
+      if (item.usedCents + creditCents > item.capacityCents) {
+        res.status(409).json({ error: `Adjustment exceeds the remaining amount for ${item.description}` });
+        return;
+      }
+    }
+  }
+
+  const adjustmentSums = db.prepare(`
+    SELECT
+      COALESCE(SUM(CASE WHEN direction = 'debit' THEN amount_cents ELSE 0 END), 0) AS debits,
+      COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount_cents ELSE 0 END), 0) AS credits
+    FROM payment_adjustments WHERE payment_id = ?
+  `).get(paymentId) as { debits: number; credits: number };
+  const paymentInvoiceCents = Number(payment.invoice_amount_cents ?? Math.round(payment.amount * 100));
+  const refundableCents = paymentInvoiceCents - adjustmentSums.debits;
+  if (direction === 'debit' && amountCents > refundableCents) {
+    res.status(409).json({ error: 'Adjustment exceeds the unrefunded amount of this payment' });
+    return;
+  }
+  if (adjustment_type === 'reversal' && (direction !== 'debit' || amountCents !== refundableCents)) {
+    res.status(409).json({ error: 'A reversal must reverse the full remaining payment amount' });
+    return;
+  }
+
+  const invoicePaid = db.prepare(`
+    SELECT
+      COALESCE((SELECT SUM(COALESCE(invoice_amount_cents, ROUND(amount * 100))) FROM payments WHERE invoice_id = ?), 0)
+      + COALESCE((SELECT SUM(CASE WHEN direction = 'credit' THEN amount_cents ELSE -amount_cents END)
+                  FROM payment_adjustments pa JOIN payments p ON p.id = pa.payment_id
+                  WHERE p.invoice_id = ?), 0) AS paid_cents
+  `).get(payment.invoice_id, payment.invoice_id) as { paid_cents: number };
+  const nextInvoicePaidCents = invoicePaid.paid_cents + (direction === 'credit' ? amountCents : -amountCents);
+  if (nextInvoicePaidCents < 0 || nextInvoicePaidCents > Math.round(payment.total_amount * 100)) {
+    res.status(409).json({ error: 'Adjustment would put the invoice paid amount outside its valid balance' });
+    return;
+  }
+
+  const id = `padj_${crypto.randomUUID()}`;
+  const createdAt = new Date().toISOString();
+  const paidAmount = nextInvoicePaidCents / 100;
+  const nextStatus = paidAmount === 0 ? 'issued' : paidAmount >= payment.total_amount ? 'paid' : 'partially_paid';
+  const cashAmountCents = paymentInvoiceCents > 0
+    ? Math.round(amountCents * Math.round(payment.amount * 100) / paymentInvoiceCents)
+    : amountCents;
+  const eurAmountCents = payment.eur_amount_cents !== null && payment.eur_amount_cents !== undefined && paymentInvoiceCents > 0
+    ? Math.round(amountCents * Number(payment.eur_amount_cents) / paymentInvoiceCents)
+    : null;
+  const saveAdjustment = db.transaction(() => {
+    db.prepare(`
+      INSERT INTO payment_adjustments (
+        id, payment_id, adjustment_type, direction, amount_cents, adjustment_date,
+        payment_method, payment_account, cash_amount_cents, eur_amount_cents,
+        reason, reference_number, recorded_by, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id, paymentId, adjustment_type, direction, amountCents, adjustment_date,
+      payment_method, payment_account.trim(), cashAmountCents, eurAmountCents,
+      reason.trim(), reference_number?.trim() || null,
+      req.user!.id, createdAt,
+    );
+    const insertAllocation = db.prepare(`
+      INSERT INTO payment_adjustment_allocations (
+        id, adjustment_id, payment_allocation_id, invoice_item_id,
+        service_label, service_category, beneficiary_student_id, amount_cents, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const allocation of normalizedAdjustmentAllocations) {
+      insertAllocation.run(
+        `padjalloc_${crypto.randomUUID()}`, id, allocation.paymentAllocationId, allocation.itemId,
+        allocation.serviceLabel, allocation.serviceCategory, allocation.beneficiaryStudentId,
+        allocation.amountCents, createdAt,
+      );
+    }
+    db.prepare('UPDATE invoices SET paid_amount = ?, status = ?, updated_at = ? WHERE id = ?')
+      .run(paidAmount, nextStatus, createdAt, payment.invoice_id);
+    if (payment.booking_id) {
+      const bookingStatus = paidAmount === 0 && direction === 'debit' && adjustment_type !== 'correction'
+        ? 'refunded'
+        : paidAmount === 0 ? 'unpaid' : nextStatus;
+      db.prepare('UPDATE bookings SET payment_status = ? WHERE id = ?').run(bookingStatus, payment.booking_id);
+    }
+  });
+  saveAdjustment();
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'ADJUST_PAYMENT',
+    entityType: 'PAYMENT_ADJUSTMENT',
+    entityId: id,
+    details: { paymentId, adjustment_type, direction, amount: amountCents / 100, reason: reason.trim() },
+    ip: req.ip,
+  });
+  res.status(201).json({ id, paymentId, paidAmount, status: nextStatus, message: 'Payment adjustment recorded' });
+});
+
+apiRouter.get('/finance/categories', requireAuth, requireRole(['owner', 'finance']), (_req: Request, res: Response): void => {
+  const categories = getFinanceCategories();
+  if (!categories) {
+    res.status(503).json({ error: 'Finance category settings are invalid and need correction' });
+    return;
+  }
+  res.json(categories);
+});
+
+apiRouter.put('/finance/categories', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const next = req.body as Partial<FinanceCategories> | undefined;
+  if (!next || !['expense', 'billing', 'income'].every((key) => {
+    const values = next[key as keyof FinanceCategories];
+    return Array.isArray(values) && values.length > 0 && values.length <= 60 &&
+      values.every((value) => typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 80) &&
+      new Set(values.map((value) => value.trim().toLowerCase())).size === values.length;
+  })) {
+    res.status(400).json({ error: 'Provide unique, non-empty expense, billing, and income category lists' });
+    return;
+  }
+  const categories: FinanceCategories = {
+    expense: next.expense!.map((value) => value.trim()),
+    billing: next.billing!.map((value) => value.trim()),
+    income: next.income!.map((value) => value.trim()),
+  };
+  if (categories.expense.some((category) => ['bill customer', 'fdd income receipt'].includes(category.toLowerCase()))) {
+    res.status(400).json({ error: 'Billing actions and income receipts cannot be classified as expenses' });
+    return;
+  }
+  if (categories.billing.some((category) => category.toLowerCase() === 'fdd income receipt') ||
+      categories.income.some((category) => category.toLowerCase() === 'bill customer')) {
+    res.status(400).json({ error: 'Customer billing actions and income receipts must remain in their corresponding transaction types' });
+    return;
+  }
+  const usedExpenses = db.prepare('SELECT DISTINCT category FROM expenses').all() as Array<{ category: string }>;
+  const usedBilling = db.prepare('SELECT DISTINCT category FROM invoice_items').all() as Array<{ category: string }>;
+  const normalizeCategory = (category: string) => {
+    const normalized = category.trim().toLowerCase().replace(/[\s_-]+/g, ' ');
+    return normalized === 'training' ? 'training session' : normalized === 'shop' ? 'shop product' : normalized;
+  };
+  if (usedExpenses.some(({ category }) => !categories.expense.includes(category)) ||
+      usedBilling.some(({ category }) => !categories.billing.some((configured) =>
+        normalizeCategory(configured) === normalizeCategory(category)))) {
+    res.status(409).json({ error: 'Existing transaction categories must remain in the configured lists' });
+    return;
+  }
+  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
+    .run('finance_categories', JSON.stringify(categories));
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'UPDATE_FINANCE_CATEGORIES',
+    entityType: 'SETTINGS',
+    details: { expense: categories.expense.length, billing: categories.billing.length, income: categories.income.length },
+    ip: req.ip,
+  });
+  res.json(categories);
+});
+
+apiRouter.get('/finance/expenses', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const expenses = db.prepare(`
+    SELECT e.*, u.full_name as approved_by_name, c.full_name AS created_by_name
+    FROM expenses e
+    LEFT JOIN users u ON e.approved_by = u.id
+    LEFT JOIN users c ON e.created_by = c.id
+    ORDER BY e.expense_date DESC
+  `).all();
+  res.json(expenses);
+});
+
+apiRouter.post('/finance/expenses', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const { category, vendor_name, amount, currency, payment_method, payment_account, expense_date, description, receipt_ref } = req.body || {};
+  const categories = getFinanceCategories();
+  const amountValue = Number(amount);
+  if (!categories) {
+    res.status(503).json({ error: 'Finance category settings are invalid and need correction' });
+    return;
+  }
+  if (typeof vendor_name !== 'string' || !vendor_name.trim() || vendor_name.length > 200 ||
+      typeof description !== 'string' || !description.trim() || description.length > 1000 ||
+      !categories.expense.includes(category) ||
+      !billingCurrencies.has(currency) ||
+      !isValidCashMethod(payment_method, currency) ||
+      !isValidFinanceAccount(payment_account) ||
+      !isValidDate(expense_date) ||
+      !Number.isFinite(amountValue) || amountValue <= 0 || amountValue > 1_000_000_000 ||
+      (typeof receipt_ref !== 'undefined' && (typeof receipt_ref !== 'string' || receipt_ref.length > 100))) {
+    res.status(400).json({ error: 'Enter a valid expense category, supplier, amount, currency, date, payment method, and account' });
+    return;
+  }
+
+  const amountCents = Math.round(amountValue * 100);
+  if (Math.abs(amountValue * 100 - amountCents) > 0.00001 ||
+      category.trim().toLowerCase() === 'exchange') {
+    res.status(400).json({ error: 'Exchange transactions must be recorded as account movements, not expenses; amounts must be in cents' });
+    return;
+  }
+  const id = `exp_${crypto.randomUUID()}`;
+  const expenseNumber = `EXP-${new Date().getFullYear()}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO expenses (
+      id, expense_number, category, vendor_name, amount, currency, payment_method, payment_account,
+      expense_date, status, approved_by, description, receipt_ref, created_by, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    expenseNumber,
+    category,
+    vendor_name,
+    amountCents / 100,
+    currency,
+    payment_method,
+    payment_account.trim(),
+    expense_date,
+    req.user!.id,
+    description,
+    receipt_ref || null,
+    req.user!.id,
+    now
+  );
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'RECORD_EXPENSE',
+    entityType: 'EXPENSE',
+    entityId: id,
+    details: { expenseNumber, category, vendor_name, amount: amountCents / 100, currency, payment_method, payment_account },
+    ip: req.ip,
+  });
+
+  res.status(201).json({ id, expenseNumber, message: 'Expense recorded' });
+});
+
+type FinanceOpeningBalances = Record<FinanceCurrency, number>;
+
+apiRouter.get('/finance/fx-rates', requireAuth, requireRole(['owner', 'finance']), (_req: Request, res: Response): void => {
+  const rates = getFinanceFxRates();
+  if (!rates) {
+    res.status(503).json({ error: 'Saved EUR conversion rates are invalid and need correction' });
+    return;
+  }
+  res.json(rates);
+});
+
+apiRouter.put('/finance/fx-rates', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const rates = req.body?.rates_to_eur as Record<string, unknown> | undefined;
+  if (!rates || typeof rates !== 'object' || Array.isArray(rates) ||
+      rates.EUR !== 1 ||
+      !financeCurrencies.slice(1).every((currency) =>
+        rates[currency] === null ||
+        (typeof rates[currency] === 'number' && Number.isFinite(rates[currency]) && rates[currency] > 0 && rates[currency] <= 1000),
+      )) {
+    res.status(400).json({ error: 'Set EUR to 1 and each other currency to a positive EUR-per-unit rate or leave it blank' });
+    return;
+  }
+  const now = new Date().toISOString();
+  const saved: FinanceFxRatesSetting = {
+    rates_to_eur: {
+      EUR: 1,
+      USD: rates.USD === null ? null : Math.round(Number(rates.USD) * 100_000_000) / 100_000_000,
+      EGP: rates.EGP === null ? null : Math.round(Number(rates.EGP) * 100_000_000) / 100_000_000,
+      GBP: rates.GBP === null ? null : Math.round(Number(rates.GBP) * 100_000_000) / 100_000_000,
+    },
+    updated_at: now,
+    updated_by_name: req.user!.full_name,
+  };
+  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').run(
+    financeFxRatesSettingKey,
+    JSON.stringify(saved),
+  );
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'UPDATE_FINANCE_FX_RATES',
+    entityType: 'SETTINGS',
+    details: { currencies: financeCurrencies, updatedAt: now },
+    ip: req.ip,
+  });
+  res.json(saved);
+});
+
+apiRouter.get('/finance/account-movements', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const { from_date, to_date, movement_type, currency, account, staff } = req.query;
+  if ((from_date && !isValidDate(from_date)) || (to_date && !isValidDate(to_date)) ||
+      (movement_type && !['transfer', 'exchange'].includes(String(movement_type))) ||
+      (currency && !billingCurrencies.has(String(currency)))) {
+    res.status(400).json({ error: 'Invalid account-movement filters' });
+    return;
+  }
+  const rows = db.prepare(`
+    SELECT m.*, u.full_name AS recorded_by_name
+    FROM finance_account_movements m
+    LEFT JOIN users u ON u.id = m.recorded_by
+    WHERE (? IS NULL OR m.movement_date >= ?)
+      AND (? IS NULL OR m.movement_date <= ?)
+      AND (? IS NULL OR m.movement_type = ?)
+      AND (? IS NULL OR m.from_currency = ? OR m.to_currency = ?)
+      AND (? IS NULL OR m.from_account LIKE ? OR m.to_account LIKE ?)
+      AND (? IS NULL OR u.full_name LIKE ?)
+    ORDER BY m.movement_date DESC, m.created_at DESC
+    LIMIT 500
+  `).all(
+    from_date || null, from_date || null,
+    to_date || null, to_date || null,
+    movement_type || null, movement_type || null,
+    currency || null, currency || null, currency || null,
+    account || null, account ? `%${account}%` : null, account ? `%${account}%` : null,
+    staff || null, staff ? `%${staff}%` : null,
+  );
+  res.json(rows);
+});
+
+apiRouter.post('/finance/account-movements', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const {
+    movement_type, from_account, from_currency, from_amount,
+    to_account, to_currency, to_amount, movement_date, reference_number, notes,
+  } = req.body || {};
+  const fromCents = Math.round(Number(from_amount) * 100);
+  const toCents = Math.round(Number(to_amount) * 100);
+  if (!['transfer', 'exchange'].includes(movement_type) ||
+      !isValidFinanceAccount(from_account) || !isValidFinanceAccount(to_account) ||
+      from_account.trim() === to_account.trim() ||
+      !billingCurrencies.has(from_currency) || !billingCurrencies.has(to_currency) ||
+      !isValidDate(movement_date) ||
+      !Number.isFinite(fromCents) || fromCents <= 0 ||
+      !Number.isFinite(toCents) || toCents <= 0 ||
+      (movement_type === 'transfer' && (from_currency !== to_currency || fromCents !== toCents)) ||
+      (movement_type === 'exchange' && from_currency === to_currency) ||
+      (typeof reference_number !== 'undefined' && (typeof reference_number !== 'string' || reference_number.length > 100)) ||
+      (typeof notes !== 'undefined' && (typeof notes !== 'string' || notes.length > 500))) {
+    res.status(400).json({ error: 'Transfers require matching currency and amounts; exchanges require different currencies and valid accounts' });
+    return;
+  }
+  const id = `move_${crypto.randomUUID()}`;
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO finance_account_movements (
+      id, movement_type, from_account, from_currency, from_amount_cents,
+      to_account, to_currency, to_amount_cents, movement_date, reference_number,
+      notes, recorded_by, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id, movement_type, from_account.trim(), from_currency, fromCents,
+    to_account.trim(), to_currency, toCents, movement_date, reference_number?.trim() || null,
+    notes?.trim() || null, req.user!.id, now,
+  );
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'RECORD_FINANCE_MOVEMENT',
+    entityType: 'FINANCE_ACCOUNT_MOVEMENT',
+    entityId: id,
+    details: { movement_type, from_account, from_currency, fromAmount: fromCents / 100, to_account, to_currency, toAmount: toCents / 100 },
+    ip: req.ip,
+  });
+  res.status(201).json({ id, movement_type, message: 'Account movement recorded; it is excluded from income and expenses' });
+});
+
+apiRouter.get('/finance/account-balances', requireAuth, requireRole(['owner', 'finance']), (_req: Request, res: Response): void => {
+  const stored = db.prepare("SELECT value FROM settings WHERE key = 'finance_account_opening_balances'").get() as { value: string } | undefined;
+  let openingRows: Array<{ account: string; currency: string; amount: number }> = [];
+  if (stored) {
+    try {
+      const parsed: unknown = JSON.parse(stored.value);
+      if (!Array.isArray(parsed) || parsed.some((row) =>
+        !row || typeof row.account !== 'string' || !billingCurrencies.has(row.currency) ||
+        typeof row.amount !== 'number' || !Number.isFinite(row.amount) || row.amount < 0,
+      )) throw new Error('Invalid saved account balances');
+      openingRows = parsed;
+    } catch {
+      res.status(503).json({ error: 'Saved account opening balances are invalid and need correction' });
+      return;
+    }
+  }
+  const totals = new Map<string, {
+    account: string; currency: string; opening_balance: number;
+    income: number; adjustments: number; expenses: number; transfers: number;
+  }>();
+  const ensure = (account: string, currency: string) => {
+    const key = `${currency}\u0000${account}`;
+    if (!totals.has(key)) totals.set(key, {
+      account, currency, opening_balance: 0, income: 0, adjustments: 0, expenses: 0, transfers: 0,
+    });
+    return totals.get(key)!;
+  };
+  for (const row of openingRows) ensure(row.account, row.currency).opening_balance = row.amount;
+  const incomeRows = db.prepare(`
+    SELECT payment_account AS account, currency, SUM(ROUND(amount * 100)) AS cents
+    FROM payments
+    WHERE payment_account IS NOT NULL AND payment_account != ''
+    GROUP BY payment_account, currency
+  `).all() as Array<{ account: string; currency: string; cents: number }>;
+  const adjustmentRows = db.prepare(`
+    SELECT pa.payment_account AS account, p.currency,
+           SUM(CASE WHEN pa.direction = 'debit'
+                    THEN COALESCE(pa.cash_amount_cents, pa.amount_cents)
+                    ELSE -COALESCE(pa.cash_amount_cents, pa.amount_cents) END) AS cents
+    FROM payment_adjustments pa JOIN payments p ON p.id = pa.payment_id
+    GROUP BY pa.payment_account, p.currency
+  `).all() as Array<{ account: string; currency: string; cents: number }>;
+  const expenseRows = db.prepare(`
+    SELECT payment_account AS account, currency, SUM(ROUND(amount * 100)) AS cents
+    FROM expenses
+    WHERE status != 'rejected' AND payment_account IS NOT NULL AND payment_account != ''
+    GROUP BY payment_account, currency
+  `).all() as Array<{ account: string; currency: string; cents: number }>;
+  const movementRows = db.prepare(`
+    SELECT account, currency, SUM(cents) AS cents FROM (
+      SELECT from_account AS account, from_currency AS currency, -from_amount_cents AS cents FROM finance_account_movements
+      UNION ALL
+      SELECT to_account AS account, to_currency AS currency, to_amount_cents AS cents FROM finance_account_movements
+    ) GROUP BY account, currency
+  `).all() as Array<{ account: string; currency: string; cents: number }>;
+  for (const row of incomeRows) ensure(row.account, row.currency).income = row.cents / 100;
+  for (const row of adjustmentRows) ensure(row.account, row.currency).adjustments = row.cents / 100;
+  for (const row of expenseRows) ensure(row.account, row.currency).expenses = row.cents / 100;
+  for (const row of movementRows) ensure(row.account, row.currency).transfers = row.cents / 100;
+  res.json([...totals.values()].map((row) => ({
+    ...row,
+    current_balance: Math.round((
+      row.opening_balance + row.income - row.adjustments - row.expenses + row.transfers
+    ) * 100) / 100,
+  })));
+});
+
+apiRouter.put('/finance/account-balances/opening', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const balances = req.body?.opening_balances;
+  if (!Array.isArray(balances) || balances.length > 200 || balances.some((row) =>
+    !row || !isValidFinanceAccount(row.account) ||
+    !billingCurrencies.has(row.currency) ||
+    typeof row.amount !== 'number' || !Number.isFinite(row.amount) || row.amount < 0 || row.amount > 1_000_000_000,
+  )) {
+    res.status(400).json({ error: 'Opening balances must contain valid account, currency, and non-negative amount entries' });
+    return;
+  }
+  const keys = new Set<string>();
+  for (const row of balances) {
+    const key = `${row.currency}\u0000${row.account.trim()}`;
+    if (keys.has(key)) {
+      res.status(400).json({ error: 'Each payment account and currency can have only one opening balance' });
+      return;
+    }
+    keys.add(key);
+  }
+  const savedBalances = balances.map((row: { account: string; currency: string; amount: number }) => ({
+    account: row.account.trim(),
+    currency: row.currency,
+    amount: Math.round(row.amount * 100) / 100,
+  }));
+  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
+    .run('finance_account_opening_balances', JSON.stringify(savedBalances));
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'UPDATE_FINANCE_ACCOUNT_OPENING_BALANCES',
+    entityType: 'SETTINGS',
+    details: { accounts: savedBalances.length },
+    ip: req.ip,
+  });
+  res.json({ message: 'Payment-account opening balances saved' });
+});
+
+function getFinanceOpeningBalances(): FinanceOpeningBalances | null {
+  const stored = db.prepare("SELECT value FROM settings WHERE key = 'finance_opening_balances'").get() as { value: string } | undefined;
+  if (!stored) return { EUR: 0, USD: 0, EGP: 0, GBP: 0 };
+
+  try {
+    const parsed: unknown = JSON.parse(stored.value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const balances = parsed as Record<string, unknown>;
+    if (!financeCurrencies.filter((currency) => currency !== 'GBP').every((currency) =>
+      typeof balances[currency] === 'number' && Number.isFinite(balances[currency]) && balances[currency] >= 0) ||
+      (typeof balances.GBP !== 'undefined' && (typeof balances.GBP !== 'number' || !Number.isFinite(balances.GBP) || balances.GBP < 0))) {
+      return null;
+    }
+    return {
+      EUR: Math.round((balances.EUR as number) * 100) / 100,
+      USD: Math.round((balances.USD as number) * 100) / 100,
+      EGP: Math.round((balances.EGP as number) * 100) / 100,
+      GBP: Math.round(((balances.GBP as number | undefined) || 0) * 100) / 100,
+    };
+  } catch {
+    return null;
+  }
+}
+
+apiRouter.get('/finance/cash-balances', requireAuth, requireRole(['owner', 'finance']), (_req: Request, res: Response): void => {
+  const openingBalances = getFinanceOpeningBalances();
+  if (!openingBalances) {
+    res.status(503).json({ error: 'Saved opening cash balances are invalid; a finance manager must correct them' });
+    return;
+  }
+
+  const incomeRows = db.prepare(`
+    SELECT currency, SUM(amount) AS total
+    FROM payments
+    GROUP BY currency
+  `).all() as Array<{ currency: string; total: number | null }>;
+  const expenseRows = db.prepare(`
+    SELECT currency, SUM(amount) AS total
+    FROM expenses
+    WHERE status != 'rejected'
+    GROUP BY currency
+  `).all() as Array<{ currency: string; total: number | null }>;
+  const adjustmentRows = db.prepare(`
+    SELECT p.currency, SUM(CASE WHEN pa.direction = 'debit'
+                                THEN COALESCE(pa.cash_amount_cents, pa.amount_cents)
+                                ELSE -COALESCE(pa.cash_amount_cents, pa.amount_cents) END) AS total_cents
+    FROM payment_adjustments pa
+    JOIN payments p ON p.id = pa.payment_id
+    GROUP BY p.currency
+  `).all() as Array<{ currency: string; total_cents: number | null }>;
+  const movementRows = db.prepare(`
+    SELECT currency, SUM(amount_cents) AS net_cents
+    FROM (
+      SELECT from_currency AS currency, -from_amount_cents AS amount_cents FROM finance_account_movements
+      UNION ALL
+      SELECT to_currency AS currency, to_amount_cents AS amount_cents FROM finance_account_movements
+    )
+    GROUP BY currency
+  `).all() as Array<{ currency: string; net_cents: number | null }>;
+  const incomeByCurrency: FinanceOpeningBalances = { EUR: 0, USD: 0, EGP: 0, GBP: 0 };
+  const expensesByCurrency: FinanceOpeningBalances = { EUR: 0, USD: 0, EGP: 0, GBP: 0 };
+  const adjustmentsByCurrency: FinanceOpeningBalances = { EUR: 0, USD: 0, EGP: 0, GBP: 0 };
+  const movementNetByCurrency: FinanceOpeningBalances = { EUR: 0, USD: 0, EGP: 0, GBP: 0 };
+  for (const row of incomeRows) {
+    if (financeCurrencies.includes(row.currency as FinanceCurrency)) {
+      incomeByCurrency[row.currency as FinanceCurrency] = Math.round((row.total || 0) * 100) / 100;
+    }
+  }
+  for (const row of expenseRows) {
+    if (financeCurrencies.includes(row.currency as FinanceCurrency)) {
+      expensesByCurrency[row.currency as FinanceCurrency] = Math.round((row.total || 0) * 100) / 100;
+    }
+  }
+  for (const row of adjustmentRows) {
+    if (financeCurrencies.includes(row.currency as FinanceCurrency)) {
+      adjustmentsByCurrency[row.currency as FinanceCurrency] = Math.round((row.total_cents || 0)) / 100;
+    }
+  }
+  for (const row of movementRows) {
+    if (financeCurrencies.includes(row.currency as FinanceCurrency)) {
+      movementNetByCurrency[row.currency as FinanceCurrency] = Math.round((row.net_cents || 0)) / 100;
+    }
+  }
+  const incomeMethodAccountRows = db.prepare(`
+    SELECT payment_method, COALESCE(payment_account, 'Unspecified legacy account') AS payment_account,
+           currency, SUM(amount) AS total
+    FROM payments
+    GROUP BY payment_method, payment_account, currency
+    ORDER BY currency, payment_method, payment_account
+  `).all();
+  const expenseMethodAccountRows = db.prepare(`
+    SELECT COALESCE(payment_method, 'Unspecified legacy method') AS payment_method,
+           COALESCE(payment_account, 'Unspecified legacy account') AS payment_account,
+           currency, SUM(amount) AS total
+    FROM expenses
+    WHERE status != 'rejected'
+    GROUP BY payment_method, payment_account, currency
+    ORDER BY currency, payment_method, payment_account
+  `).all();
+  const currentBalances = Object.fromEntries(financeCurrencies.map((currency) => [
+    currency,
+    Math.round((
+      openingBalances[currency] + incomeByCurrency[currency] -
+      expensesByCurrency[currency] - adjustmentsByCurrency[currency] +
+      movementNetByCurrency[currency]
+    ) * 100) / 100,
+  ])) as FinanceOpeningBalances;
+  res.json({
+    opening_balances: openingBalances,
+    income_by_currency: incomeByCurrency,
+    expenses_by_currency: expensesByCurrency,
+    adjustments_by_currency: adjustmentsByCurrency,
+    movement_net_by_currency: movementNetByCurrency,
+    income_by_method_account: incomeMethodAccountRows,
+    expenses_by_method_account: expenseMethodAccountRows,
+    current_balances: currentBalances,
+  });
+});
+
+apiRouter.patch('/finance/cash-balances', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  const balances = req.body?.opening_balances;
+  if (!balances || typeof balances !== 'object' || Array.isArray(balances) ||
+      !financeCurrencies.every((currency) => typeof balances[currency] === 'number' && Number.isFinite(balances[currency]) && balances[currency] >= 0 && balances[currency] <= 1_000_000_000)) {
+    res.status(400).json({ error: 'Opening balances must include non-negative EUR, USD, EGP, and GBP amounts' });
+    return;
+  }
+
+  const openingBalances: FinanceOpeningBalances = {
+    EUR: Math.round(balances.EUR * 100) / 100,
+    USD: Math.round(balances.USD * 100) / 100,
+    EGP: Math.round(balances.EGP * 100) / 100,
+    GBP: Math.round(balances.GBP * 100) / 100,
+  };
+  const now = new Date().toISOString();
+  db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
+    .run('finance_opening_balances', JSON.stringify(openingBalances));
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'UPDATE_FINANCE_OPENING_BALANCES',
+    entityType: 'SETTINGS',
+    details: { currencies: financeCurrencies, updatedAt: now },
+    ip: req.ip,
+  });
+  res.json({ opening_balances: openingBalances, message: 'Opening cash balances saved' });
+});
+
+apiRouter.get('/finance/summary', requireAuth, requireRole(['owner', 'finance']), (req: Request, res: Response): void => {
+  // Aggregate revenue and expenses by currency
+  const invoiceStats = db.prepare(`
+    SELECT currency,
+           COUNT(*) as invoice_count,
+           SUM(total_amount) as total_invoiced,
+           SUM(paid_amount) as total_collected,
+           SUM(total_amount - paid_amount) as outstanding
+    FROM invoices
+    WHERE status != 'cancelled'
+    GROUP BY currency
+  `).all();
+
+  const expenseStats = db.prepare(`
+    SELECT currency,
+           COUNT(*) as expense_count,
+           SUM(amount) as total_expenses
+    FROM expenses
+    WHERE status != 'rejected'
+    GROUP BY currency
+  `).all();
+
+  const overdueInvoices = db.prepare(`
+    SELECT COUNT(*) as count, SUM(total_amount - paid_amount) as amount
+    FROM invoices
+    WHERE status IN ('issued', 'partially_paid') AND due_date < date('now')
+  `).get();
+
+  res.json({
+    invoiceStats,
+    expenseStats,
+    overdueInvoices,
+  });
+});
+
+// ==========================================
+// 8. PAYROLL MODULE (Strict Auth: Owner, Finance, HR)
+// ==========================================
+
+apiRouter.get('/payroll/periods', requireAuth, requireRole(['owner', 'finance', 'hr']), (req: Request, res: Response): void => {
+  const periods = db.prepare(`
+    SELECT p.*, u.full_name as approved_by_name,
+           (SELECT COUNT(*) FROM payroll_records r WHERE r.period_id = p.id) as staff_count,
+           (SELECT SUM(gross_pay) FROM payroll_records r WHERE r.period_id = p.id) as total_gross,
+           (SELECT SUM(net_pay) FROM payroll_records r WHERE r.period_id = p.id) as total_net
+    FROM payroll_periods p
+    LEFT JOIN users u ON p.approved_by = u.id
+    ORDER BY p.start_date DESC
+  `).all();
+  res.json(periods);
+});
+
+apiRouter.post('/payroll/periods', requireAuth, requireRole(['owner', 'finance', 'hr']), (req: Request, res: Response): void => {
+  const { period_name, start_date, end_date, notes } = req.body;
+  if (!period_name || !start_date || !end_date) {
+    res.status(400).json({ error: 'Period name, start date, and end date are required' });
+    return;
+  }
+
+  const id = 'pr_' + crypto.randomUUID().slice(0, 10);
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO payroll_periods (id, period_name, start_date, end_date, status, notes, created_at)
+    VALUES (?, ?, ?, ?, 'draft', ?, ?)
+  `).run(id, period_name, start_date, end_date, notes || null, now);
+
+  // Automatically generate draft records for all active staff
+  const staff = db.prepare('SELECT id, role, monthly_salary, session_commission FROM users WHERE is_active = 1').all() as any[];
+  const insertRecord = db.prepare(`
+    INSERT INTO payroll_records (
+      id, period_id, employee_id, base_salary, session_commission, sessions_taught,
+      bonuses, deductions, gross_pay, tax_withholding, net_pay, currency, status, notes, created_at
+    ) VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, 0, ?, 'EUR', 'pending', ?, ?)
+  `);
+
+  for (const s of staff) {
+    const recId = 'rec_' + crypto.randomUUID().slice(0, 10);
+    const base = s.monthly_salary || 0;
+    insertRecord.run(
+      recId,
+      id,
+      s.id,
+      base,
+      s.session_commission || 0,
+      base,
+      base,
+      'Base monthly compensation draft',
+      now
+    );
+  }
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'CREATE_PAYROLL_PERIOD',
+    entityType: 'PAYROLL',
+    entityId: id,
+    details: { period_name, start_date, end_date },
+    ip: req.ip,
+  });
+
+  res.status(201).json({ id, message: 'Payroll period initialized for active staff' });
+});
+
+apiRouter.get('/payroll/records/:periodId', requireAuth, requireRole(['owner', 'finance', 'hr']), (req: Request, res: Response): void => {
+  const { periodId } = req.params;
+  const records = db.prepare(`
+    SELECT r.*, u.full_name, u.role, u.email
+    FROM payroll_records r
+    JOIN users u ON r.employee_id = u.id
+    WHERE r.period_id = ?
+    ORDER BY u.full_name ASC
+  `).all(periodId);
+  res.json(records);
+});
+
+apiRouter.patch('/payroll/records/:id', requireAuth, requireRole(['owner', 'finance', 'hr']), (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const { base_salary, sessions_taught, session_commission, bonuses, deductions, tax_withholding, notes, status } = req.body;
+
+  const rec = db.prepare('SELECT * FROM payroll_records WHERE id = ?').get(id) as any;
+  if (!rec) {
+    res.status(404).json({ error: 'Payroll record not found' });
+    return;
+  }
+
+  const base = base_salary !== undefined ? Number(base_salary) : rec.base_salary;
+  const sessions = sessions_taught !== undefined ? Number(sessions_taught) : rec.sessions_taught;
+  const commRate = session_commission !== undefined ? Number(session_commission) : rec.session_commission;
+  const bonus = bonuses !== undefined ? Number(bonuses) : rec.bonuses;
+  const deduct = deductions !== undefined ? Number(deductions) : rec.deductions;
+  const tax = tax_withholding !== undefined ? Number(tax_withholding) : rec.tax_withholding;
+
+  const totalCommission = sessions * commRate;
+  const gross = base + totalCommission + bonus;
+  const net = gross - deduct - tax;
+
+  db.prepare(`
+    UPDATE payroll_records
+    SET base_salary = ?, sessions_taught = ?, session_commission = ?, bonuses = ?,
+        deductions = ?, tax_withholding = ?, gross_pay = ?, net_pay = ?,
+        notes = COALESCE(?, notes), status = COALESCE(?, status)
+    WHERE id = ?
+  `).run(base, sessions, commRate, bonus, deduct, tax, gross, net, notes || null, status || null, id);
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'UPDATE_PAYROLL_RECORD',
+    entityType: 'PAYROLL_RECORD',
+    entityId: id,
+    details: { gross, net, sessions, bonus, deduct },
+    ip: req.ip,
+  });
+
+  res.json({ message: 'Payroll record updated', gross, net });
+});
+
+apiRouter.post('/payroll/periods/:id/approve', requireAuth, requireRole(['owner']), (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    UPDATE payroll_periods
+    SET status = 'approved', approved_by = ?, approved_at = ?
+    WHERE id = ?
+  `).run(req.user!.id, now, id);
+
+  db.prepare(`
+    UPDATE payroll_records
+    SET status = 'approved'
+    WHERE period_id = ?
+  `).run(id);
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'APPROVE_PAYROLL_PERIOD',
+    entityType: 'PAYROLL',
+    entityId: id,
+    details: { approvedAt: now },
+    ip: req.ip,
+  });
+
+  res.json({ success: true, message: 'Payroll period approved by Center Owner' });
+});
+
+// ==========================================
+// 9. EQUIPMENT & GEAR INVENTORY
+// ==========================================
+
+apiRouter.get('/equipment', requireAuth, (req: Request, res: Response): void => {
+  const { category, lowStock } = req.query;
+  let query = 'SELECT * FROM equipment WHERE 1=1';
+  const params: any[] = [];
+
+  if (category) {
+    query += ' AND category = ?';
+    params.push(category);
+  }
+
+  if (lowStock === 'true') {
+    query += ' AND quantity_available <= low_stock_threshold';
+  }
+
+  query += ' ORDER BY item_name ASC';
+  const items = db.prepare(query).all(...params);
+  res.json(items);
+});
+
+apiRouter.get('/equipment/checkouts', requireAuth, (req: Request, res: Response): void => {
+  const checkouts = db.prepare(`
+    SELECT c.id, c.equipment_id, e.item_name, e.size, c.student_id,
+           s.first_name || ' ' || s.last_name AS student_name,
+           c.instructor_id, c.checkout_time, c.expected_return, c.condition_out, c.notes
+    FROM equipment_checkouts c
+    JOIN equipment e ON e.id = c.equipment_id
+    LEFT JOIN students s ON s.id = c.student_id
+    WHERE c.actual_return IS NULL
+    ORDER BY c.expected_return ASC, c.checkout_time ASC
+  `).all();
+  res.json(checkouts);
+});
+
+apiRouter.post('/equipment', requireAuth, requireRole(['owner', 'operations_manager', 'equipment_manager']), (req: Request, res: Response): void => {
+  const { item_name, category, size, brand_model, quantity_total, condition, location, low_stock_threshold, notes } = req.body;
+  if (!item_name || !category) {
+    res.status(400).json({ error: 'Item name and category are required' });
+    return;
+  }
+
+  const id = 'eq_' + crypto.randomUUID().slice(0, 10);
+  const barcode = 'FD-GEAR-' + Math.floor(1000 + Math.random() * 9000);
+  const now = new Date().toISOString();
+  const qty = Number(quantity_total) || 1;
+
+  db.prepare(`
+    INSERT INTO equipment (
+      id, barcode, item_name, category, size, brand_model,
+      quantity_total, quantity_available, condition, location,
+      last_inspected, low_stock_threshold, notes, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    barcode,
+    item_name,
+    category,
+    size || null,
+    brand_model || null,
+    qty,
+    qty,
+    condition || 'excellent',
+    location || 'Gear Room A - Dahab Main',
+    now.slice(0, 10),
+    Number(low_stock_threshold) || 2,
+    notes || null,
+    now,
+    now
+  );
+
+  res.status(201).json({ id, barcode, message: 'Gear registered in inventory' });
+});
+
+apiRouter.patch('/equipment/:id', requireAuth, requireRole(['owner', 'operations_manager', 'equipment_manager']), (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const { condition, quantity_total, quantity_available, location, last_inspected, notes } = req.body;
+
+  const updates: string[] = ['updated_at = ?'];
+  const values: any[] = [new Date().toISOString()];
+
+  if (condition !== undefined) { updates.push('condition = ?'); values.push(condition); }
+  if (quantity_total !== undefined) { updates.push('quantity_total = ?'); values.push(Number(quantity_total)); }
+  if (quantity_available !== undefined) { updates.push('quantity_available = ?'); values.push(Number(quantity_available)); }
+  if (location !== undefined) { updates.push('location = ?'); values.push(location); }
+  if (last_inspected !== undefined) { updates.push('last_inspected = ?'); values.push(last_inspected); }
+  if (notes !== undefined) { updates.push('notes = ?'); values.push(notes); }
+
+  values.push(id);
+  db.prepare(`UPDATE equipment SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+  res.json({ message: 'Equipment inventory updated' });
+});
+
+apiRouter.post('/equipment/:id/checkout', requireAuth, (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const { student_id, instructor_id, expected_return, condition_out, notes } = req.body;
+
+  const item = db.prepare('SELECT * FROM equipment WHERE id = ?').get(id) as any;
+  if (!item) {
+    res.status(404).json({ error: 'Equipment not found' });
+    return;
+  }
+
+  if (item.quantity_available <= 0) {
+    res.status(400).json({ error: 'No units available for checkout. Item is out of stock.' });
+    return;
+  }
+
+  const checkoutId = 'chk_' + crypto.randomUUID().slice(0, 10);
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO equipment_checkouts (id, equipment_id, student_id, instructor_id, checkout_time, expected_return, condition_out, notes, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    checkoutId,
+    id,
+    student_id || null,
+    instructor_id || null,
+    now,
+    expected_return || null,
+    condition_out || item.condition,
+    notes || null,
+    now
+  );
+
+  db.prepare('UPDATE equipment SET quantity_available = quantity_available - 1, updated_at = ? WHERE id = ?').run(now, id);
+
+  res.status(201).json({ checkoutId, message: 'Gear checkout recorded' });
+});
+
+apiRouter.post('/equipment/checkouts/:id/return', requireAuth, (req: Request, res: Response): void => {
+  const { id } = req.params;
+  const { condition_in, notes } = req.body;
+
+  const chk = db.prepare('SELECT * FROM equipment_checkouts WHERE id = ?').get(id) as any;
+  if (!chk) {
+    res.status(404).json({ error: 'Checkout record not found' });
+    return;
+  }
+
+  if (chk.actual_return) {
+    res.status(400).json({ error: 'Gear has already been returned' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE equipment_checkouts
+    SET actual_return = ?, condition_in = ?, notes = COALESCE(?, notes)
+    WHERE id = ?
+  `).run(now, condition_in || 'good', notes || null, id);
+
+  db.prepare('UPDATE equipment SET quantity_available = quantity_available + 1, condition = COALESCE(?, condition), updated_at = ? WHERE id = ?')
+    .run(condition_in || null, now, chk.equipment_id);
+
+  res.json({ success: true, message: 'Gear returned to inventory' });
+});
+
+// ==========================================
+// 10. AUDIT LOGS (Owner Only)
+// ==========================================
+
+apiRouter.get('/audit-logs', requireAuth, requireRole(['owner']), (req: Request, res: Response): void => {
+  const { search, limit } = req.query;
+  let query = 'SELECT * FROM audit_logs WHERE 1=1';
+  const params: any[] = [];
+
+  if (search) {
+    query += ' AND (action LIKE ? OR entity_type LIKE ? OR user_email LIKE ? OR details LIKE ?)';
+    const term = `%${search}%`;
+    params.push(term, term, term, term);
+  }
+
+  query += ' ORDER BY created_at DESC LIMIT ?';
+  params.push(Number(limit) || 100);
+
+  const logs = db.prepare(query).all(...params);
+  res.json(logs);
+});
+
+// ==========================================
+// 11. SYSTEM SETTINGS & SECURE BACKUP
+// ==========================================
+
+apiRouter.get('/settings', requireAuth, (req: Request, res: Response): void => {
+  const settingsRows = db.prepare('SELECT key, value FROM settings').all() as any[];
+  const settingsMap: Record<string, string> = {};
+  for (const s of settingsRows) {
+    settingsMap[s.key] = s.value;
+  }
+  res.json(settingsMap);
+});
+
+apiRouter.patch('/settings', requireAuth, requireRole(['owner']), (req: Request, res: Response): void => {
+  const { settings } = req.body;
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    res.status(400).json({ error: 'Invalid settings object' });
+    return;
+  }
+
+  const hasBookingSafetyRules = Object.prototype.hasOwnProperty.call(settings, 'booking_safety_rules');
+  const bookingSafetyRules = hasBookingSafetyRules
+    ? normalizeBookingSafetyRules(settings.booking_safety_rules)
+    : null;
+  if (hasBookingSafetyRules && !bookingSafetyRules) {
+    res.status(400).json({
+      error: 'Booking safety rules must include waiver_valid_days (1-3650), minimum_deposit_percent (1-100), max_divers_per_buoy (1-10), and ras_mohamed_min_participants (1-100)',
+    });
+    return;
+  }
+
+  const upsert = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
+  for (const [key, value] of Object.entries(settings)) {
+    upsert.run(key, key === 'booking_safety_rules' ? JSON.stringify(bookingSafetyRules) : String(value));
+  }
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'UPDATE_SYSTEM_SETTINGS',
+    entityType: 'SETTINGS',
+    details: { changedKeys: Object.keys(settings) },
+    ip: req.ip,
+  });
+
+  res.json({ message: 'Settings saved successfully' });
+});
+
+const DEFAULT_CENTER_SETTINGS: Record<string, string> = {
+  center_name: 'Freedive Dahab',
+  address: 'Dahab, South Sinai, Egypt',
+  phone: '+20 100 234 5678',
+  whatsapp: '+20 100 234 5678',
+  email: 'info@freedivedahab.com',
+  currency_default: 'EUR',
+  timezone: 'Africa/Cairo',
+  notify_deposit_reminders: 'true',
+  notify_low_stock_alerts: 'true',
+  notify_waiver_expiring: 'true',
+  notify_arrival_reminders: 'true',
+  notify_daily_summary_email: 'false',
+};
+
+function isValidTimezone(value: unknown): value is string {
+  if (typeof value !== 'string' || !value.trim() || value.length > 64) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: value.trim() });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const centerSettingValidators: Record<string, (value: unknown) => boolean> = {
+  center_name: (value) => typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 120,
+  address: (value) => typeof value === 'string' && value.trim().length <= 200,
+  phone: (value) => typeof value === 'string' && value.trim().length <= 40,
+  whatsapp: (value) => typeof value === 'string' && value.trim().length <= 40,
+  email: (value) => typeof value === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim()) && value.trim().length <= 120,
+  currency_default: (value) => typeof value === 'string' && financeCurrencies.includes(value as typeof financeCurrencies[number]),
+  timezone: isValidTimezone,
+  notify_deposit_reminders: (value) => typeof value === 'boolean',
+  notify_low_stock_alerts: (value) => typeof value === 'boolean',
+  notify_waiver_expiring: (value) => typeof value === 'boolean',
+  notify_arrival_reminders: (value) => typeof value === 'boolean',
+  notify_daily_summary_email: (value) => typeof value === 'boolean',
+};
+
+apiRouter.get('/settings/center', requireAuth, (_req: Request, res: Response): void => {
+  const rows = db.prepare('SELECT key, value, updated_at FROM center_settings').all() as any[];
+  const centerSettings: Record<string, string> = { ...DEFAULT_CENTER_SETTINGS };
+  const updatedAtByKey: Record<string, string> = {};
+  for (const row of rows) {
+    if (Object.prototype.hasOwnProperty.call(centerSettingValidators, row.key)) {
+      centerSettings[row.key] = row.value;
+    }
+    updatedAtByKey[row.key] = row.updated_at;
+  }
+  res.json({ settings: centerSettings, updated_at: updatedAtByKey });
+});
+
+apiRouter.put('/settings/center', requireAuth, requireRole(['owner']), (req: Request, res: Response): void => {
+  const body = req.body;
+  if (!body || typeof body !== 'object' || Array.isArray(body) || !body.settings || typeof body.settings !== 'object' || Array.isArray(body.settings)) {
+    res.status(400).json({ error: 'A settings object is required' });
+    return;
+  }
+
+  const incoming = body.settings as Record<string, unknown>;
+  const entries = Object.entries(incoming);
+  if (entries.length === 0) {
+    res.status(400).json({ error: 'At least one center setting is required' });
+    return;
+  }
+
+  for (const [key, value] of entries) {
+    const validate = centerSettingValidators[key];
+    if (!validate) {
+      res.status(400).json({ error: `Unknown center setting '${key}'` });
+      return;
+    }
+    if (!validate(value)) {
+      res.status(400).json({ error: `Invalid value for center setting '${key}'` });
+      return;
+    }
+  }
+
+  const now = new Date().toISOString();
+  const upsert = db.prepare(`
+    INSERT INTO center_settings (key, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `);
+  for (const [key, value] of entries) {
+    upsert.run(key, typeof value === 'boolean' ? String(value) : String(value).trim(), now);
+  }
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'UPDATE_CENTER_SETTINGS',
+    entityType: 'SETTINGS',
+    details: { changedKeys: entries.map(([key]) => key) },
+    ip: req.ip,
+  });
+
+  res.json({ message: 'Center settings saved successfully', updatedAt: now });
+});
+
+// Full database backup export in JSON format
+const handleBackupExport = (req: Request, res: Response): void => {
+  const tables = [
+    'users', 'students', 'inquiries', 'courses', 'pos_catalog_items', 'course_sessions', 'bookings',
+    'daily_activities', 'activity_participants', 'invoices', 'invoice_items', 'customer_requests',
+    'payments', 'payment_allocations', 'payment_adjustments', 'payment_adjustment_allocations',
+    'expenses', 'finance_account_movements', 'payroll_periods', 'payroll_records', 'equipment',
+    'equipment_checkouts', 'settings', 'center_settings', 'audit_logs'
+  ];
+
+  const backupData: Record<string, any[]> = {};
+  for (const t of tables) {
+    // Redact password hash and salt for users export
+    if (t === 'users') {
+      backupData[t] = db.prepare(`
+        SELECT id, email, full_name, role, is_active, phone, emergency_contact, languages, certifications,
+               hourly_rate, session_commission, monthly_salary, created_at, updated_at
+        FROM users
+      `).all();
+    } else {
+      backupData[t] = db.prepare(`SELECT * FROM ${t}`).all();
+    }
+  }
+
+  logAudit({
+    userId: req.user!.id,
+    userEmail: req.user!.email,
+    userRole: req.user!.role,
+    action: 'EXPORT_DATABASE_BACKUP',
+    entityType: 'DATABASE',
+    details: { timestamp: new Date().toISOString() },
+    ip: req.ip,
+  });
+
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="freedive_dahab_backup_${new Date().toISOString().slice(0, 10)}.json"`);
+  res.json({
+    exportVersion: '1.0.0',
+    centerName: 'Freedive Dahab Egypt',
+    exportedAt: new Date().toISOString(),
+    exportedBy: req.user!.email,
+    data: backupData,
+  });
+};
+
+apiRouter.get('/backup', requireAuth, requireRole(['owner']), handleBackupExport);
+apiRouter.get('/backup/export', requireAuth, requireRole(['owner']), handleBackupExport);

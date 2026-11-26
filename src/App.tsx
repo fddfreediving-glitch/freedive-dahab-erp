@@ -1,0 +1,883 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useEffect, useCallback, Suspense } from 'react';
+import {
+  User,
+  UserRole,
+  Student,
+  Course,
+  CourseSession,
+  Booking,
+  DailyActivity,
+  Invoice,
+  InvoiceUpdateInput,
+  CustomerRequest,
+  CustomerRequestInput,
+  PaymentInput,
+  Expense,
+  PosCatalogItem,
+  PosCatalogItemInput,
+  PayrollPeriod,
+  PayrollRecord,
+  Equipment,
+  EquipmentCheckout,
+  AuditLog,
+  Inquiry,
+  StudentRegistrationInput,
+} from './types';
+import { Language, translations } from './i18n';
+import { apiRequest, setApiToken } from './api';
+import { ReferenceNavbar } from './components/ReferenceNavbar';
+import { ReferenceSidebar } from './components/ReferenceSidebar';
+import { NavTab } from './components/Navigation';
+const DashboardView = React.lazy(() => import('./components/DashboardView').then((module) => ({ default: module.DashboardView })));
+const StudentsCrmView = React.lazy(() => import('./components/StudentsCrmView').then((module) => ({ default: module.StudentsCrmView })));
+const ContactsView = React.lazy(() => import('./components/ContactsView').then((module) => ({ default: module.ContactsView })));
+const CoursesView = React.lazy(() => import('./components/CoursesView').then((module) => ({ default: module.CoursesView })));
+const GoogleCalendarView = React.lazy(() => import('./components/GoogleCalendarView').then((module) => ({ default: module.GoogleCalendarView })));
+const DailyOpsView = React.lazy(() => import('./components/DailyOpsView').then((module) => ({ default: module.DailyOpsView })));
+const StaffView = React.lazy(() => import('./components/StaffView').then((module) => ({ default: module.StaffView })));
+const FinanceView = React.lazy(() => import('./components/FinanceView').then((module) => ({ default: module.FinanceView })));
+const InvoiceReportsView = React.lazy(() => import('./components/InvoiceReportsView').then((module) => ({ default: module.InvoiceReportsView })));
+const PayrollView = React.lazy(() => import('./components/PayrollView').then((module) => ({ default: module.PayrollView })));
+const EquipmentView = React.lazy(() => import('./components/EquipmentView').then((module) => ({ default: module.EquipmentView })));
+const AuditView = React.lazy(() => import('./components/AuditView').then((module) => ({ default: module.AuditView })));
+const SettingsView = React.lazy(() => import('./components/SettingsView').then((module) => ({ default: module.SettingsView })));
+const NotificationsView = React.lazy(() => import('./components/NotificationsView').then((module) => ({ default: module.NotificationsView })));
+const PosView = React.lazy(() => import('./components/PosView').then((module) => ({ default: module.PosView })));
+import { BrandMark } from './components/BrandMark';
+import {
+  Waves,
+  Shield,
+  Lock,
+  ArrowRight,
+  UserCheck,
+  Compass,
+  AlertCircle,
+  Loader2,
+} from 'lucide-react';
+
+export default function App() {
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
+  const [lang, setLang] = useState<Language>('en');
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    const savedTheme = localStorage.getItem('fd_theme');
+    return savedTheme === 'light' || savedTheme === 'dark' ? savedTheme : 'dark';
+  });
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
+  const demoLoginEnabled = import.meta.env.VITE_ALLOW_DEMO_LOGIN === 'true';
+
+  // Core ERP State
+  const [students, setStudents] = useState<Student[]>([]);
+  const [inquiries, setInquiries] = useState<Inquiry[]>([]);
+  const [courses, setCourses] = useState<Course[]>([]);
+  const [sessions, setSessions] = useState<CourseSession[]>([]);
+  const [bookings, setBookings] = useState<Booking[]>([]);
+  const [activities, setActivities] = useState<DailyActivity[]>([]);
+  const [staff, setStaff] = useState<User[]>([]);
+  const [invoices, setInvoices] = useState<Invoice[]>([]);
+  const [invoiceToOpen, setInvoiceToOpen] = useState<Invoice | null>(null);
+  const [customerRequests, setCustomerRequests] = useState<CustomerRequest[]>([]);
+  const [expenses, setExpenses] = useState<Expense[]>([]);
+  const [payrollPeriods, setPayrollPeriods] = useState<PayrollPeriod[]>([]);
+  const [payrollRecords, setPayrollRecords] = useState<PayrollRecord[]>([]);
+  const [selectedPayrollPeriodId, setSelectedPayrollPeriodId] = useState<string>('');
+  const [equipment, setEquipment] = useState<Equipment[]>([]);
+  const [equipmentCheckouts, setEquipmentCheckouts] = useState<EquipmentCheckout[]>([]);
+  const [posCatalogItems, setPosCatalogItems] = useState<PosCatalogItem[]>([]);
+  const [posCatalogError, setPosCatalogError] = useState<string | null>(null);
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [arrivalRemindersEnabled, setArrivalRemindersEnabled] = useState(true);
+
+  // Prefilled owner credentials are a local training convenience only; the
+  // production sign-in form must start empty.
+  const [loginEmail, setLoginEmail] = useState(demoLoginEnabled ? 'owner@freedivedahab.com' : '');
+  const [loginPassword, setLoginPassword] = useState(demoLoginEnabled ? 'DahabOwner2026!' : '');
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [loginSubmitting, setLoginSubmitting] = useState(false);
+
+  // Sync HTML dir attribute for bidirectional support (RTL / LTR)
+  useEffect(() => {
+    document.documentElement.dir = lang === 'ar' ? 'rtl' : 'ltr';
+    document.documentElement.lang = lang;
+  }, [lang]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    let active = true;
+    apiRequest<{ settings?: Record<string, string> }>('/api/settings/center')
+      .then((response) => {
+        if (active && response.settings?.notify_arrival_reminders !== undefined) {
+          setArrivalRemindersEnabled(response.settings.notify_arrival_reminders === 'true');
+        }
+      })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, [currentUser?.id]);
+
+  // Sync dark class on document root
+  useEffect(() => {
+    if (theme === 'dark') {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+    localStorage.setItem('fd_theme', theme);
+  }, [theme]);
+
+  // Load all operational data
+  const loadAllData = useCallback(async () => {
+    try {
+      const [
+        studentsRes,
+        inquiriesRes,
+        coursesRes,
+        sessionsRes,
+        bookingsRes,
+        activitiesRes,
+        staffRes,
+        equipmentRes,
+        equipmentCheckoutsRes,
+        posCatalogRes,
+      ] = await Promise.all([
+        apiRequest<Student[]>('/api/students').catch(() => []),
+        apiRequest<Inquiry[]>('/api/inquiries').catch(() => []),
+        apiRequest<Course[]>('/api/courses').catch(() => []),
+        apiRequest<CourseSession[]>('/api/sessions').catch(() => []),
+        apiRequest<Booking[]>('/api/bookings').catch(() => []),
+        apiRequest<DailyActivity[]>('/api/activities').catch(() => []),
+        apiRequest<User[]>('/api/users').catch(() => []),
+        apiRequest<Equipment[]>('/api/equipment').catch(() => []),
+        apiRequest<EquipmentCheckout[]>('/api/equipment/checkouts').catch(() => []),
+        apiRequest<PosCatalogItem[]>('/api/pos/catalog')
+          .then((items) => {
+            if (!Array.isArray(items)) {
+              throw new Error('The POS catalogue response was invalid.');
+            }
+            setPosCatalogError(null);
+            return items;
+          })
+          .catch((error) => {
+            setPosCatalogError(error instanceof Error ? error.message : 'The POS catalogue could not be loaded.');
+            return [];
+          }),
+      ]);
+
+      setStudents(studentsRes);
+      setInquiries(inquiriesRes);
+      setCourses(coursesRes);
+      setSessions(sessionsRes);
+      setBookings(bookingsRes);
+      setActivities(activitiesRes);
+      setStaff(staffRes);
+      setEquipment(equipmentRes);
+      setEquipmentCheckouts(equipmentCheckoutsRes);
+      setPosCatalogItems(posCatalogRes);
+      // Load restricted data based on current user role
+      if (currentUser && ['owner', 'finance'].includes(currentUser.role)) {
+        const [invoicesRes, requestsRes, expensesRes] = await Promise.all([
+          apiRequest<Invoice[]>('/api/finance/invoices').catch(() => []),
+          apiRequest<CustomerRequest[]>('/api/customer-requests').catch(() => []),
+          apiRequest<Expense[]>('/api/finance/expenses').catch(() => []),
+        ]);
+        setInvoices(invoicesRes);
+        setCustomerRequests(requestsRes);
+        setExpenses(expensesRes);
+      } else if (currentUser?.role === 'front_desk_crm') {
+        const requestsRes = await apiRequest<CustomerRequest[]>('/api/customer-requests').catch(() => []);
+        setCustomerRequests(requestsRes);
+        setInvoices([]);
+        setExpenses([]);
+      } else {
+        setInvoices([]);
+        setCustomerRequests([]);
+        setExpenses([]);
+      }
+
+      if (currentUser && ['owner', 'finance', 'hr'].includes(currentUser.role)) {
+        const periods = await apiRequest<PayrollPeriod[]>('/api/payroll/periods').catch(() => []);
+        setPayrollPeriods(periods);
+        if (periods.length > 0) {
+          const activePid = selectedPayrollPeriodId || periods[0].id;
+          setSelectedPayrollPeriodId(activePid);
+          const records = await apiRequest<PayrollRecord[]>(`/api/payroll/records/${activePid}`).catch(() => []);
+          setPayrollRecords(records);
+        }
+      } else {
+        setPayrollPeriods([]);
+        setPayrollRecords([]);
+      }
+
+      if (currentUser && currentUser.role === 'owner') {
+        const logs = await apiRequest<AuditLog[]>('/api/audit-logs').catch(() => []);
+        setAuditLogs(logs);
+      } else {
+        setAuditLogs([]);
+      }
+    } catch (err) {
+      console.error('Failed to load operational data:', err);
+    }
+  }, [currentUser, selectedPayrollPeriodId]);
+
+  // Initial session check on mount
+  useEffect(() => {
+    async function checkAuth() {
+      try {
+        const res = await apiRequest<{ user: User }>('/api/auth/me');
+        if (res && res.user) {
+          setCurrentUser(res.user);
+        }
+      } catch {
+        // Passwordless owner sign-in is a local training convenience, never a
+        // production fallback.
+        if (!demoLoginEnabled) {
+          setLoading(false);
+          return;
+        }
+        try {
+          const loginRes = await apiRequest<{ token: string; user: User }>('/api/auth/switch-demo', {
+            method: 'POST',
+            body: JSON.stringify({ role: 'owner' }),
+          });
+          setApiToken(loginRes.token);
+          setCurrentUser(loginRes.user);
+        } catch {
+          // Stay logged out
+        }
+      } finally {
+        setLoading(false);
+      }
+    }
+    checkAuth();
+  }, [demoLoginEnabled]);
+
+  // Reload data whenever user changes
+  useEffect(() => {
+    if (currentUser) {
+      loadAllData();
+    }
+  }, [currentUser, loadAllData]);
+
+  // Handle Role Switch
+  const handleRoleSwitch = async (targetRole: UserRole) => {
+    try {
+      const res = await apiRequest<{ token: string; user: User }>('/api/auth/switch-demo', {
+        method: 'POST',
+        body: JSON.stringify({ role: targetRole }),
+      });
+      setApiToken(res.token);
+      setCurrentUser(res.user);
+
+      // Route away if current tab is restricted
+      if (['finance', 'reports', 'payroll', 'audit', 'pos'].includes(activeTab)) {
+        if (activeTab === 'audit' && targetRole !== 'owner') {
+          setActiveTab('dashboard');
+        } else if (activeTab === 'reports' && !['owner', 'finance'].includes(targetRole)) {
+          setActiveTab('dashboard');
+        } else if (activeTab === 'pos' && !['owner', 'finance', 'front_desk_crm'].includes(targetRole)) {
+          setActiveTab('dashboard');
+        } else if (activeTab === 'finance' && !['owner', 'finance', 'front_desk_crm'].includes(targetRole)) {
+          setActiveTab('dashboard');
+        } else if (activeTab === 'payroll' && !['owner', 'finance', 'hr'].includes(targetRole)) {
+          setActiveTab('dashboard');
+        }
+      }
+    } catch (err: any) {
+      alert(err.message || 'Failed to switch role');
+    }
+  };
+
+  const handleTabChange = (tab: NavTab) => {
+    setActiveTab(tab);
+    setIsMobileSidebarOpen(false);
+  };
+
+  // Sign out
+  const handleLogout = async () => {
+    try {
+      await apiRequest('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // Ignore
+    }
+    setApiToken(null);
+    setCurrentUser(null);
+  };
+
+  // Credentials login submit
+  const handleLoginSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError(null);
+    setLoginSubmitting(true);
+    try {
+      const res = await apiRequest<{ token: string; user: User }>('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ email: loginEmail, password: loginPassword }),
+      });
+      setApiToken(res.token);
+      setCurrentUser(res.user);
+    } catch (err: any) {
+      if (err instanceof TypeError) {
+        setLoginError('Cannot reach the operations server. Check the connection and try again.');
+      } else {
+        setLoginError(err.message || 'Login failed. Please verify credentials.');
+      }
+    } finally {
+      setLoginSubmitting(false);
+    }
+  };
+
+  const handleSelectPayrollPeriod = async (pid: string) => {
+    setSelectedPayrollPeriodId(pid);
+    try {
+      const records = await apiRequest<PayrollRecord[]>(`/api/payroll/records/${pid}`);
+      setPayrollRecords(records);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleOpenQuickModal = (modalType: 'student' | 'activity' | 'inquiry' | 'invoice' | 'gear') => {
+    if (modalType === 'student') setActiveTab('students_crm');
+    if (modalType === 'inquiry') setActiveTab('students_crm');
+    if (modalType === 'activity') setActiveTab('daily_ops');
+    if (modalType === 'invoice') setActiveTab('finance');
+    if (modalType === 'gear') setActiveTab('equipment');
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-[#F4F6FA] dark:bg-[#0F172A] flex flex-col items-center justify-center text-[#28334E] dark:text-white">
+        <Loader2 className="w-10 h-10 text-[#4C8BF5] animate-spin mb-4" />
+        <h2 className="text-xl font-bold font-sans tracking-tight text-[#28334E] dark:text-white">
+          FREEDIVE DAHAB ERP
+        </h2>
+        <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+          Operations, CRM & Student Management System
+        </p>
+      </div>
+    );
+  }
+
+  // Logged out portal
+  if (!currentUser) {
+    return (
+      <div className="min-h-screen bg-[#F4F6FA] dark:bg-[#0F172A] flex items-center justify-center p-4">
+        <div className="w-full max-w-md bg-white dark:bg-[#1E293B] border border-[#E8EEF7] dark:border-slate-800 rounded-2xl shadow-xl p-8 space-y-6">
+          <div className="text-center space-y-2">
+            <BrandMark className="mx-auto h-28 max-w-[240px]" />
+            <h1 className="sr-only">Freedive Dahab</h1>
+            <p className="text-xs text-slate-500 dark:text-slate-400 font-medium">
+              Internal Business Operations & CRM System
+            </p>
+          </div>
+
+          {loginError && (
+            <div role="alert" className="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/80 border border-rose-200 dark:border-rose-800 text-rose-700 dark:text-rose-300 text-xs flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              <span>{loginError}</span>
+            </div>
+          )}
+
+          <form onSubmit={handleLoginSubmit} className="space-y-4 text-xs">
+            <div>
+              <label className="block text-slate-600 dark:text-slate-400 mb-1 font-bold">Staff Email</label>
+              <input
+                type="email"
+                required
+                value={loginEmail}
+                onChange={(e) => setLoginEmail(e.target.value)}
+                className="w-full bg-[#F4F6FA] dark:bg-[#0c1427] border border-[#E8EEF7] dark:border-slate-700 rounded-xl p-3 text-slate-900 dark:text-white focus:outline-none focus:border-[#4C8BF5]"
+              />
+            </div>
+            <div>
+              <label className="block text-slate-600 dark:text-slate-400 mb-1 font-bold">Password</label>
+              <input
+                type="password"
+                required
+                value={loginPassword}
+                onChange={(e) => setLoginPassword(e.target.value)}
+                className="w-full bg-[#F4F6FA] dark:bg-[#0c1427] border border-[#E8EEF7] dark:border-slate-700 rounded-xl p-3 text-slate-900 dark:text-white focus:outline-none focus:border-[#4C8BF5]"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={loginSubmitting}
+              className="w-full py-3 rounded-xl bg-[#4C8BF5] hover:bg-[#3B7BE8] text-white font-bold text-xs uppercase tracking-wider transition-colors cursor-pointer shadow-md shadow-blue-500/20"
+            >
+              {loginSubmitting ? 'Authenticating...' : 'Sign In to Operations'}
+            </button>
+          </form>
+
+          {/* Quick Demo Sign-in Helper */}
+          {demoLoginEnabled && (
+          <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-2">
+            <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider text-center">
+              Quick Role Test
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={() => handleRoleSwitch('owner')}
+                className="p-2 rounded-xl bg-blue-50 dark:bg-slate-800 text-[#4C8BF5] dark:text-blue-300 border border-blue-200 dark:border-slate-700 text-xs font-bold cursor-pointer text-left"
+              >
+                <div>Center Owner</div>
+                <div className="text-[10px] text-slate-500 font-normal">Full Authority</div>
+              </button>
+              <button
+                onClick={() => handleRoleSwitch('instructor')}
+                className="p-2 rounded-xl bg-amber-50 dark:bg-slate-800 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-slate-700 text-xs font-bold cursor-pointer text-left"
+              >
+                <div>Instructor</div>
+                <div className="text-[10px] text-slate-500 font-normal">Operational View</div>
+              </button>
+              <button
+                onClick={() => handleRoleSwitch('finance')}
+                className="p-2 rounded-xl bg-emerald-50 dark:bg-slate-800 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-slate-700 text-xs font-bold cursor-pointer text-left"
+              >
+                <div>Finance Manager</div>
+                <div className="text-[10px] text-slate-500 font-normal">Invoices & Cash</div>
+              </button>
+              <button
+                onClick={() => handleRoleSwitch('front_desk_crm')}
+                className="p-2 rounded-xl bg-purple-50 dark:bg-slate-800 text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-slate-700 text-xs font-bold cursor-pointer text-left"
+              >
+                <div>Front Desk / CRM</div>
+                <div className="text-[10px] text-slate-500 font-normal">Guest Roster</div>
+              </button>
+            </div>
+          </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const instructorsList = staff.filter((s) => ['instructor', 'operations_manager', 'owner'].includes(s.role));
+  const isDark = theme === 'dark';
+  const cairoTodayParts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Cairo', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+  const cairoToday = Object.fromEntries(cairoTodayParts.map(({ type, value }) => [type, value]));
+  const notificationToday = `${cairoToday.year}-${cairoToday.month}-${cairoToday.day}`;
+  const addDays = (date: string, days: number) => {
+    const value = new Date(`${date}T12:00:00`);
+    value.setDate(value.getDate() + days);
+    return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+  };
+  const notificationHorizon = addDays(notificationToday, 7);
+  const arrivalReminderHorizon = addDays(notificationToday, 3);
+  const operationalNotificationCount =
+    inquiries.filter((inquiry) => inquiry.status === 'new').length +
+    equipment.filter((item) => item.quantity_available <= item.low_stock_threshold).length +
+    sessions.filter((session) =>
+      session.status !== 'cancelled' &&
+      session.start_date >= notificationToday &&
+      session.start_date <= notificationHorizon,
+    ).length +
+    activities.filter((activity) =>
+      activity.status !== 'completed' &&
+      activity.status !== 'cancelled_weather' &&
+      activity.activity_date >= notificationToday &&
+      activity.activity_date <= notificationHorizon,
+    ).length +
+    (arrivalRemindersEnabled ? students.filter((student) => student.arrival_date && student.arrival_date >= notificationToday && student.arrival_date <= arrivalReminderHorizon).length : 0);
+
+  return (
+    <div className={`min-h-screen flex flex-col font-sans selection:bg-[#4C8BF5] selection:text-white ${
+      isDark ? 'bg-[#0F172A] text-slate-100' : 'bg-[#F4F6FA] text-[#28334E]'
+    }`}>
+      {/* Sidebar matching Reference Picture (Left, Full Height with rounded-br-[42px]) */}
+      <ReferenceSidebar
+        activeTab={activeTab}
+        onTabChange={handleTabChange}
+        isMobileOpen={isMobileSidebarOpen}
+        onCloseMobile={() => setIsMobileSidebarOpen(false)}
+        userRole={currentUser.role}
+        currentUser={currentUser}
+        isCollapsed={isSidebarCollapsed}
+        onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+        lang={lang}
+        theme={theme}
+      />
+
+      {/* Main Panel matching Reference Picture */}
+      <div
+        className={`flex-1 flex flex-col min-h-screen transition-all duration-300 ${
+          isSidebarCollapsed
+            ? 'md:pl-20 rtl:md:pl-0 rtl:md:pr-20'
+            : 'md:pl-64 rtl:md:pl-0 rtl:md:pr-64'
+        }`}
+      >
+        {/* Top Navbar matching "Search" and "Hi, Tom" from Reference Picture */}
+        <ReferenceNavbar
+          currentUser={currentUser}
+          onRoleSwitch={handleRoleSwitch}
+          demoEnabled={demoLoginEnabled}
+          lang={lang}
+          onLanguageChange={setLang}
+          onLogout={handleLogout}
+          theme={theme}
+          onToggleTheme={() => setTheme(theme === 'light' ? 'dark' : 'light')}
+          inquiries={inquiries}
+          auditLogs={auditLogs}
+          onNavigateTab={handleTabChange}
+          onToggleMobileMenu={() => setIsMobileSidebarOpen((open) => !open)}
+          notificationCount={operationalNotificationCount}
+        />
+
+        {/* Content Area */}
+        <main className="flex-1 px-4 sm:px-8 py-4 space-y-6 max-w-7xl w-full mx-auto">
+          <Suspense fallback={<div role="status" className="min-h-48 animate-pulse rounded-2xl bg-slate-200/70 dark:bg-slate-800/70" aria-label="Loading ERP page" />}>
+            {activeTab === 'dashboard' && (
+              <DashboardView
+                currentUser={currentUser}
+                sessions={sessions}
+                activities={activities}
+                equipment={equipment}
+                invoices={invoices}
+                customerRequests={customerRequests}
+                expenses={expenses}
+                inquiries={inquiries}
+                onNavigate={handleTabChange}
+                onOpenQuickModal={handleOpenQuickModal}
+                onRefresh={loadAllData}
+              />
+            )}
+
+            {activeTab === 'students_crm' && (
+              <StudentsCrmView
+                students={students}
+                inquiries={inquiries}
+                invoices={invoices}
+                catalogItems={posCatalogItems}
+                onCreateCustomerInvoice={async (payload) => {
+                  await apiRequest('/api/customers/with-invoice', { method: 'POST', body: JSON.stringify(payload) });
+                  await loadAllData();
+                }}
+                onRegisterStudent={async (student: StudentRegistrationInput) => {
+                  await apiRequest('/api/students', { method: 'POST', body: JSON.stringify(student) });
+                  await loadAllData();
+                  handleTabChange('contacts');
+                }}
+                onRecordDeposit={async (invoice, amount, paymentDate) => {
+                  const cashAccount = `Cash ${invoice.currency}`;
+                  await apiRequest(`/api/finance/invoices/${invoice.id}/payments`, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      amount,
+                      currency: invoice.currency,
+                      customer_id: invoice.student_id,
+                      payment_method: cashAccount,
+                      payment_account: cashAccount,
+                      payment_date: paymentDate,
+                      reference_number: '',
+                      notes: 'Customer deposit recorded from Customers',
+                    }),
+                  });
+                  await loadAllData();
+                }}
+                onOpenInvoice={(invoice) => {
+                  setInvoiceToOpen(invoice);
+                  handleTabChange('finance');
+                }}
+                userRole={currentUser.role}
+                onRefresh={loadAllData}
+                onUpdateWaiver={async (id, signed, notes) => {
+                  await apiRequest(`/api/students/${id}/waiver`, {
+                    method: 'POST',
+                    body: JSON.stringify({ signed, notes }),
+                  });
+                }}
+                onUpdateMedicalClearance={async (id, status) => {
+                  await apiRequest(`/api/students/${id}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ medical_clearance_status: status }),
+                  });
+                }}
+                onUpdateStay={async (id, details) => {
+                  await apiRequest(`/api/students/${id}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify(details),
+                  });
+                }}
+                onUpdateValidation={async (id, values) => {
+                  await apiRequest(`/api/students/${id}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify(values),
+                  });
+                }}
+                onCreateInquiry={async (data) => {
+                  await apiRequest('/api/inquiries', { method: 'POST', body: JSON.stringify(data) });
+                }}
+                onUpdateInquiryStatus={async (id, status) => {
+                  await apiRequest(`/api/inquiries/${id}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ status }),
+                  });
+                  await loadAllData();
+                }}
+                lang={lang}
+              />
+            )}
+
+            {activeTab === 'contacts' && (
+              <ContactsView
+                students={students}
+                userRole={currentUser.role}
+                onRegister={async (student: StudentRegistrationInput) => {
+                  await apiRequest('/api/students', { method: 'POST', body: JSON.stringify(student) });
+                  await loadAllData();
+                }}
+              />
+            )}
+
+            {activeTab === 'courses' && (
+              <CoursesView
+                courses={courses}
+                sessions={sessions}
+                students={students}
+                instructors={instructorsList}
+                bookings={bookings}
+                userRole={currentUser.role}
+                onRefresh={loadAllData}
+                onScheduleSession={async (data) => {
+                  await apiRequest('/api/sessions', { method: 'POST', body: JSON.stringify(data) });
+                }}
+                onUpdateSession={async (id, data) => {
+                  await apiRequest(`/api/sessions/${id}`, { method: 'PATCH', body: JSON.stringify(data) });
+                }}
+                onUpdateBooking={async (id, data) => {
+                  await apiRequest(`/api/bookings/${id}`, { method: 'PATCH', body: JSON.stringify(data) });
+                }}
+                onEnrollBooking={async (data) => {
+                  await apiRequest('/api/bookings', { method: 'POST', body: JSON.stringify(data) });
+                }}
+                lang={lang}
+              />
+            )}
+
+            {activeTab === 'calendar' && (
+              <GoogleCalendarView />
+            )}
+
+            {activeTab === 'notifications' && (
+              <NotificationsView
+                sessions={sessions}
+                activities={activities}
+                equipment={equipment}
+                inquiries={inquiries}
+                students={students}
+                arrivalRemindersEnabled={arrivalRemindersEnabled}
+                onNavigate={handleTabChange}
+              />
+            )}
+
+            {activeTab === 'pos' && (
+              <PosView
+                students={students}
+                equipment={equipment}
+                catalogItems={posCatalogItems}
+                catalogError={posCatalogError}
+                userRole={currentUser.role}
+                onCreateCustomerRequest={async (data: CustomerRequestInput) => {
+                  await apiRequest('/api/customer-requests', { method: 'POST', body: JSON.stringify(data) });
+                }}
+                onSaveCatalogItem={async (data: PosCatalogItemInput, id?: string) => {
+                  await apiRequest(id ? `/api/pos/catalog/${id}` : '/api/pos/catalog', {
+                    method: id ? 'PATCH' : 'POST',
+                    body: JSON.stringify(data),
+                  });
+                  await loadAllData();
+                }}
+                onArchiveCatalogItem={async (id: string) => {
+                  await apiRequest(`/api/pos/catalog/${id}`, { method: 'DELETE' });
+                  await loadAllData();
+                }}
+                onRefresh={loadAllData}
+              />
+            )}
+
+            {activeTab === 'daily_ops' && (
+              <DailyOpsView
+                activities={activities}
+                students={students}
+                instructors={instructorsList}
+                userRole={currentUser.role}
+                onRefresh={loadAllData}
+                onCreateActivity={async (data) => {
+                  await apiRequest('/api/activities', { method: 'POST', body: JSON.stringify(data) });
+                }}
+                onUpdateActivityStatus={async (id, status) => {
+                  await apiRequest(`/api/activities/${id}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify({ status }),
+                  });
+                  await loadAllData();
+                }}
+                onAddParticipant={async (actId, pData) => {
+                  await apiRequest(`/api/activities/${actId}/participants`, {
+                    method: 'POST',
+                    body: JSON.stringify(pData),
+                  });
+                }}
+                lang={lang}
+              />
+            )}
+
+            {activeTab === 'staff' && (
+              <StaffView
+                staff={staff}
+                userRole={currentUser.role}
+                onRefresh={loadAllData}
+                onCreateStaff={async (data) => {
+                  await apiRequest('/api/users', { method: 'POST', body: JSON.stringify(data) });
+                }}
+                lang={lang}
+              />
+            )}
+
+            {activeTab === 'finance' && (
+              <FinanceView
+                key="finance"
+                invoices={invoices}
+                invoiceToOpen={invoiceToOpen}
+                onInvoiceOpenHandled={() => setInvoiceToOpen(null)}
+                customerRequests={customerRequests}
+                expenses={expenses}
+                students={students}
+                userRole={currentUser.role}
+                onRefresh={loadAllData}
+                onCreateInvoice={async (data) => {
+                  await apiRequest('/api/finance/invoices', { method: 'POST', body: JSON.stringify(data) });
+                }}
+                onUpdateInvoice={async (invoiceId: string, changes: InvoiceUpdateInput) => {
+                  await apiRequest(`/api/finance/invoices/${invoiceId}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify(changes),
+                  });
+                }}
+                onRecordPayment={async (invId, pmt) => {
+                  await apiRequest(`/api/finance/invoices/${invId}/payments`, {
+                    method: 'POST',
+                    body: JSON.stringify(pmt),
+                  });
+                }}
+                onCreateCustomerRequest={async (data: CustomerRequestInput) => {
+                  await apiRequest('/api/customer-requests', { method: 'POST', body: JSON.stringify(data) });
+                }}
+                onRecordCustomerRequestPayment={async (requestId: string, payment: PaymentInput) => {
+                  await apiRequest(`/api/customer-requests/${requestId}/payments`, {
+                    method: 'POST',
+                    body: JSON.stringify(payment),
+                  });
+                }}
+                onCreateExpense={async (data) => {
+                  await apiRequest('/api/finance/expenses', { method: 'POST', body: JSON.stringify(data) });
+                }}
+                lang={lang}
+              />
+            )}
+
+            {activeTab === 'reports' && (
+              <InvoiceReportsView
+                invoices={invoices}
+                userRole={currentUser.role}
+                onRefresh={loadAllData}
+                onUpdateInvoice={async (invoiceId: string, changes: InvoiceUpdateInput) => {
+                  await apiRequest(`/api/finance/invoices/${invoiceId}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify(changes),
+                  });
+                }}
+              />
+            )}
+
+            {activeTab === 'payroll' && (
+              <PayrollView
+                periods={payrollPeriods}
+                records={payrollRecords}
+                selectedPeriodId={selectedPayrollPeriodId}
+                onSelectPeriod={handleSelectPayrollPeriod}
+                userRole={currentUser.role}
+                onRefresh={loadAllData}
+                onCreatePeriod={async (data) => {
+                  await apiRequest('/api/payroll/periods', { method: 'POST', body: JSON.stringify(data) });
+                }}
+                onUpdateRecord={async (recId, data) => {
+                  await apiRequest(`/api/payroll/records/${recId}`, {
+                    method: 'PATCH',
+                    body: JSON.stringify(data),
+                  });
+                }}
+                onApprovePeriod={async (pid) => {
+                  await apiRequest(`/api/payroll/periods/${pid}/approve`, { method: 'POST' });
+                }}
+                lang={lang}
+              />
+            )}
+
+            {activeTab === 'equipment' && (
+              <EquipmentView
+                equipment={equipment}
+                checkouts={equipmentCheckouts}
+                students={students}
+                instructors={instructorsList}
+                userRole={currentUser.role}
+                onRefresh={loadAllData}
+                onAddEquipment={async (data) => {
+                  await apiRequest('/api/equipment', { method: 'POST', body: JSON.stringify(data) });
+                }}
+                onCheckoutEquipment={async (eqId, data) => {
+                  await apiRequest(`/api/equipment/${eqId}/checkout`, { method: 'POST', body: JSON.stringify(data) });
+                }}
+                onReturnEquipment={async (chkId, data) => {
+                  await apiRequest(`/api/equipment/checkouts/${chkId}/return`, { method: 'POST', body: JSON.stringify(data) });
+                }}
+                lang={lang}
+              />
+            )}
+
+            {activeTab === 'audit' && (
+              <AuditView
+                logs={auditLogs}
+                userRole={currentUser.role}
+                onRefresh={loadAllData}
+                lang={lang}
+              />
+            )}
+
+            {activeTab === 'settings' && (
+              <SettingsView
+                userRole={currentUser.role}
+                lang={lang}
+                onArrivalReminderPreferenceChange={setArrivalRemindersEnabled}
+              />
+            )}
+          </Suspense>
+          </main>
+
+          {/* Footer matching Reference Design */}
+          <footer
+            className={`border-t py-4 px-8 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
+              isDark ? 'border-slate-800 text-slate-500' : 'border-[#E8EEF7] text-slate-400'
+            }`}
+          >
+            <div>
+              <span>© 2026 </span>
+              <strong className="text-[#4C8BF5] font-semibold">Freedive Dahab Operations & CRM ERP</strong>
+              <span>. All rights reserved.</span>
+            </div>
+            <div className="flex items-center gap-3 text-[11px]">
+              <span>Dahab, South Sinai, Egypt</span>
+              <span>•</span>
+              <span>Timezone: Africa/Cairo (UTC+2)</span>
+            </div>
+          </footer>
+        </div>
+      </div>
+  );
+}

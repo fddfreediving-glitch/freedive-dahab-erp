@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: freedive-dahab-erp
+    runtime: node
+    plan: starter
+    region: frankfurt
+    buildCommand: npm ci --legacy-peer-deps && npm run typecheck && npm test && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ALLOW_DEMO_LOGIN
+        value: "false"
+      - key: VITE_ALLOW_DEMO_LOGIN
+        value: "false"
+      - key: DATA_DIR
+        value: /var/data
+      - key: INITIAL_OWNER_EMAIL
+        sync: false
+      - key: INITIAL_OWNER_NAME
+        sync: false
+      - key: INITIAL_OWNER_PASSWORD
+        sync: false
+    disk:
+      name: freedive-dahab-data
+      mountPath: /var/data
+      sizeGB: 1
